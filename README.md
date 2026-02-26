@@ -581,12 +581,182 @@ pytest tests/ -v
 
 ---
 
-## Citation
+## Citations
 
-If you use this codebase, please cite the relevant benchmarks:
+If you use this codebase, please cite the relevant benchmarks, methods, and
+tools. Brief explanations are included so it is clear why each reference matters.
 
-- **C5G7**: OECD/NEA, NEA/NSC/DOC(2003)16 — *Benchmark on Deterministic Transport Calculations Without Spatial Homogenisation*
-- **C5G7-TD**: OECD/NEA, NEA/NSC/DOC(2016)7 — *Deterministic Time-Dependent Neutron Transport Benchmark*
-- **Kobayashi**: OECD/NEA, NSC-DOC(2000)4 — *3-D Radiation Transport Benchmark Problems with Void Region*
-- **Pinte 2009**: Pinte et al., A&A 498, 967–980 (2009) — *Benchmark problems for continuum radiative transfer*
-- **OpenMC**: Romano et al., Ann. Nucl. Energy 82 (2015) 90–97
+---
+
+### Benchmark definitions and reference solutions
+
+- **C5G7 steady-state benchmark**
+  OECD/NEA. *Benchmark on Deterministic Transport Calculations Without Spatial
+  Homogenisation: A 2-D/3-D MOX Fuel Assembly Benchmark.* NEA/NSC/DOC(2003)16.
+  OECD, 2003.
+  → Defines the 7-group MOX quarter-core geometry, all six material cross
+  sections, and the published reference k-effective and flux distributions used
+  as ground truth in this work.
+
+- **C5G7-TD time-dependent benchmark**
+  OECD/NEA. *Deterministic Time-Dependent Neutron Transport Benchmark Without
+  Spatial Homogenisation.* NEA/NSC/DOC(2016)7. OECD, 2016.
+  → Extends C5G7 with rod-ejection transients; provides the 6-group
+  delayed-neutron parameters (β_i, λ_i) hardcoded in `src/data/converters/c5g7_td.py`.
+
+- **Kobayashi 3D void benchmark**
+  OECD/NEA. *3-D Radiation Transport Benchmark Problems and Solutions with
+  Void Region.* NSC/DOC(2000)4. OECD, 2000.
+  → Defines the three void-duct geometries (L-shaped, dogleg, dog-ear) and
+  the published σ_t values used in `src/data/converters/kobayashi.py`.
+
+- **Pinte et al. 2009 radiative transfer benchmark**
+  Pinte, C., Harries, T. J., Min, M., et al. *Benchmark problems for continuum
+  radiative transfer — High optical depths, anisotropic scattering, and polarisation.*
+  A&A 498, 967–980 (2009). https://doi.org/10.1051/0004-6361/200811474
+  → Provides the protoplanetary disk density law, stellar parameters, and
+  published intensity maps used as the Pinte 2009 benchmark target.
+
+---
+
+### Neural operator architectures
+
+- **FNO — Fourier Neural Operator**
+  Li, Z., Kovachki, N., Azizzadenesheli, K., Liu, B., Bhattacharya, K.,
+  Stuart, A., Anandkumar, A. *Fourier Neural Operator for Parametric Partial
+  Differential Equations.* ICLR 2021. https://arxiv.org/abs/2010.08895
+  → The spectral convolution backbone used in `src/models/fno.py`. The key
+  property — learning in frequency space — makes FNO resolution-invariant in
+  principle, which is directly tested by the resolution-transfer protocol.
+
+- **DeepONet**
+  Lu, L., Jin, P., Pang, G., Zhang, Z., Karniadakis, G. E. *Learning Nonlinear
+  Operators via DeepONet Based on the Universal Approximation Theorem of Operators.*
+  Nature Machine Intelligence 3, 218–229 (2021). https://doi.org/10.1038/s42256-021-00302-5
+  → The branch-trunk factorisation used in `src/models/deeponet.py`. The
+  trunk net evaluates at arbitrary query points (x, ω), enabling
+  discretization-agnostic angular evaluation.
+
+- **Universal approximation for operators (theoretical basis for DeepONet)**
+  Chen, T., Chen, H. *Universal Approximation to Nonlinear Operators by Neural
+  Networks with Arbitrary Activation Functions and Its Application to Dynamical
+  Systems.* IEEE Trans. Neural Netw. 6(4), 911–917 (1995).
+  → Original theoretical result that operator learning with neural networks is
+  universal; motivates the DeepONet design.
+
+- **Neural operators (general framework)**
+  Kovachki, N., Li, Z., Liu, B., Azizzadenesheli, K., Bhattacharya, K.,
+  Stuart, A., Anandkumar, A. *Neural Operator: Learning Maps Between Function
+  Spaces With Applications to PDEs.* JMLR 24(89), 1–97 (2023).
+  https://arxiv.org/abs/2108.08481
+  → Unified framework for neural operators; provides the theoretical context
+  for evaluating FNO and DeepONet on transport problems.
+
+---
+
+### Asymptotic-preserving methods (AP / APNN)
+
+- **AP neural network for multiscale kinetic equations (APNN)**
+  Jin, S., Ma, Z. *Asymptotic-Preserving Neural Networks for Multiscale Kinetic
+  Equations.* Communications in Computational Physics 31(5), 1497–1524 (2022).
+  https://doi.org/10.4208/cicp.OA-2021-0166
+  → Introduces the idea of building the diffusion limit directly into the
+  network architecture. The macro-micro decomposition `I = I_P1 + R` in
+  `src/models/ap_micromacro.py` is directly motivated by this work.
+
+- **AP schemes for radiative transfer (classical reference)**
+  Jin, S. *Efficient Asymptotic-Preserving (AP) Schemes for Some Multiscale
+  Kinetic Equations.* SIAM J. Sci. Comput. 21(2), 441–454 (1999).
+  https://doi.org/10.1137/S1064827598334599
+  → Original AP scheme paper; defines the ε-scaling and the requirement that
+  a numerical method recover the diffusion limit as ε → 0, which is the
+  property the AP Micro-Macro model satisfies by construction.
+
+- **Micro-macro decomposition for transport**
+  Lemou, M., Mieussens, L. *A New Asymptotic Preserving Scheme Based on
+  Micro-Macro Formulation for Linear Kinetic Equations in the Diffusion Limit.*
+  SIAM J. Sci. Comput. 31(1), 334–368 (2008).
+  https://doi.org/10.1137/07069479X
+  → Formal derivation of the micro-macro splitting that the AP Micro-Macro
+  model implements: the macroscopic (P1) part is solved exactly, and the
+  microscopic residual R is learned.
+
+- **P1 closure and diffusion approximation**
+  Pomraning, G. C. *The Equations of Radiation Hydrodynamics.* Pergamon Press,
+  1973. (Reprint: Dover, 2005.)
+  → Classic reference for the P1 angular approximation used in the deterministic
+  macro reconstruction `I_P1(x,ω) = φ/(4π) + (3/4π) J·ω`.
+
+- **APNN for the Boltzmann equation**
+  Jin, S., Ma, Z., Wu, K. *Asymptotic-Preserving Neural Networks for the
+  Boltzmann Equation.* Journal of Scientific Computing 97, 22 (2023).
+  https://doi.org/10.1007/s10915-023-02331-3
+  → Extends APNN to the full Boltzmann setting and studies convergence in the
+  diffusion limit; directly relevant to the regime-sweep evaluation protocol.
+
+---
+
+### Rational activation functions
+
+- **Rational activations library**
+  Boullé, N., Nakatsukasa, Y., Townsend, A. *Rational Neural Networks.*
+  NeurIPS 2020. https://arxiv.org/abs/2004.01902
+  → Theoretical paper showing that rational functions approximate smooth
+  targets exponentially faster than ReLU networks; motivates replacing fixed
+  nonlinearities with trainable rationals in the transport operator.
+
+- **`rational_activations` PyTorch library**
+  Delfosse, T., Schmerling, P., Kerber, P., et al. *Recurrent Rational Networks.*
+  https://github.com/ml-research/rational_activations (2021).
+  → The specific library (`from rational.torch import Rational`) used in
+  Task 6. Implements Padé-type rational activations as `nn.Module` with
+  trainable numerator/denominator coefficients.
+
+---
+
+### Reference solvers
+
+- **OpenMC Monte Carlo transport**
+  Romano, P. K., Horelik, N. E., Herman, B. R., Nelson, A. G., Forget, B.,
+  Smith, K. *OpenMC: A State-of-the-Art Monte Carlo Code for Research and
+  Development.* Ann. Nucl. Energy 82, 90–97 (2015).
+  https://doi.org/10.1016/j.anucene.2014.07.048
+  → The Monte Carlo solver used to generate real C5G7 flux targets via
+  `src/solvers/openmc_c5g7_model.py` once the binary is installed.
+
+- **OpenSn (formerly OpenSN/Chi-Tech) discrete ordinates solver**
+  Ragusa, J., et al. *OpenSn.* https://github.com/Open-Sn/opensn
+  → The SN solver interfaced in `src/solvers/opensn_interface.py`, intended
+  for generating reference Kobayashi and C5G7-TD flux solutions once installed
+  under WSL2/Linux.
+
+---
+
+### Supporting libraries and tools
+
+- **PyTorch**
+  Paszke, A., Gross, S., Massa, F., et al. *PyTorch: An Imperative Style,
+  High-Performance Deep Learning Library.* NeurIPS 2019.
+  https://arxiv.org/abs/1912.01703
+  → Core deep learning framework for all model implementations.
+
+- **Hydra configuration framework**
+  Yadan, O. *Hydra — A Framework for Elegantly Configuring Complex Applications.*
+  GitHub (2019). https://github.com/facebookresearch/hydra
+  → Used for all config composition, CLI overrides, and sweep management.
+
+- **einops**
+  Rogozhnikov, A. *Einops: Clear and Reliable Tensor Manipulations with
+  Einstein-like Notation.* ICLR 2022. https://arxiv.org/abs/2011.04674
+  → Used for readable tensor reshaping in the model forward passes.
+
+- **h5py / HDF5**
+  Collette, A. *Python and HDF5.* O'Reilly, 2013.
+  https://www.h5py.org
+  → Default data storage backend on Windows (`src/data/io.py`); avoids the
+  atomic-rename `PermissionError` that affects Zarr on Windows.
+
+- **zarr**
+  Miles, A., et al. *Zarr: An implementation of chunked, compressed,
+  N-dimensional arrays for Python.* https://zarr.readthedocs.io
+  → Data storage backend on Linux/macOS (`src/data/io.py`).
