@@ -28,11 +28,118 @@ generalization across three axes relative to standard activations (ReLU/GELU/SiL
 All three axes are tested on **C5G7 MOX, C5G7-TD, Kobayashi 3D void**, and
 **Pinte et al. 2009** benchmarks.
 
-The AP Micro-Macro model explicitly decomposes the intensity as
-`I = I_P1(φ, J) + R`, which by construction recovers the correct diffusion
-limit as ε → 0. Rational activations — learnable piecewise-rational functions
-that adapt their shape during training — are the candidate nonlinearity being
-tested across all three model families (FNO, DeepONet, AP Micro-Macro).
+Rational activations — learnable piecewise-rational functions that adapt their
+shape during training — are the candidate nonlinearity being tested across all
+three model families (FNO, DeepONet, AP Micro-Macro).
+
+---
+
+## The AP Micro-Macro Model
+
+### The core difficulty: stiffness across regimes
+
+The scaled linear transport equation reads
+
+> **ε ∂_t I + Ω·∇I = (1/ε)(⟨I⟩ − I) + source**
+
+where ε is the Knudsen number (mean free path / domain size). When **ε = O(1)**
+(transport regime) the angular variable Ω matters: the solution is anisotropic,
+with strong directional flux near sources and in voids. When **ε → 0**
+(diffusion regime) the collision term dominates, the solution becomes nearly
+isotropic, and I(x,ω) ≈ φ(x)/(4π) everywhere — the full angular dependence
+collapses to a scalar.
+
+A plain neural network (FNO, DeepONet) trained across all ε must learn both
+extremes from the same weights. The diffusion limit and the transport limit
+require qualitatively different representations, so the network tends to average
+them and do neither well — this is precisely the failure mode that standard
+PINNs exhibit on multiscale problems, as demonstrated in the APNN literature
+[[Jin & Ma 2022](#asymptotic-preserving-methods-ap--apnn),
+[Li et al. 2022](#asymptotic-preserving-methods-ap--apnn),
+[Bertaglia 2022](#asymptotic-preserving-methods-ap--apnn)].
+
+### The decomposition
+
+The AP Micro-Macro model avoids this by **hard-coding the diffusion limit into
+the architecture**. The intensity is split as:
+
+```
+I(x, ω) = I_P1(x, ω)   +   R(x, ω)
+           ────────────      ────────
+           MacroNet          MicroNet
+           (FNO → φ, J)      (MLP residual)
+           deterministic      learned
+           P1 closure
+```
+
+**I_P1** is not learned — it is the explicit P1 angular reconstruction:
+
+```
+I_P1(x, ω) = φ(x)/(4π) + (3/4π) J(x)·ω      [3D]
+I_P1(x, ω) = φ(x)/(2π) + (2/2π) J(x)·ω      [2D]
+```
+
+This is the leading-order term of the Chapman-Enskog expansion of the transport
+equation [[Pomraning 1973](#asymptotic-preserving-methods-ap--apnn)]. It
+integrates to give φ exactly, its first angular moment gives J exactly, and it
+is isotropic when J = 0 — all of which are required by the diffusion limit.
+
+**MacroNet** (FNO-based) predicts the spatial moments φ(x) and J(x) by
+processing the full input fields (σ_a, σ_s, q, BC) on a spatial grid. FNO is
+used here because global spatial correlations matter: in a reactor core the flux
+shape at one pin depends on the geometry of the entire assembly.
+
+**MicroNet** (MLP-based) predicts the angular residual R(x, ω) — the deviation
+from the P1 reconstruction. R captures transport effects that P1 cannot:
+directional streaming in voids, angular peaking near strong sources, boundary
+layers. The MicroNet takes as input the spatial latent from MacroNet, Fourier
+features of ω, and log(ε), so it can learn to suppress corrections in the
+diffusion regime.
+
+### Why this is theoretically sound
+
+1. **The diffusion limit is exact by construction.** As ε → 0, I → φ/(4π)
+   and R → 0. MacroNet only needs to learn the diffusion equation (a scalar
+   elliptic PDE — much simpler). The network does not have to discover the
+   diffusion limit from data.
+
+2. **The network learns only the non-trivial part.** R is precisely the
+   transport correction that cannot be expressed by a moment closure. In
+   optically thick regions R ≈ 0 and the model is effectively a diffusion
+   solver. In transport-dominated regions R carries the full angular structure.
+
+3. **Moment consistency is enforced by an explicit loss term.** The quadrature
+   moments of the predicted I are penalised for disagreeing with MacroNet's
+   direct φ, J predictions, coupling the two sub-networks.
+
+4. **The ε-weighted diffusion loss** provides extra gradient signal toward the
+   diffusion limit when ε is small — the regime where data is hardest to
+   generate and training is most unstable.
+
+This design is inspired by the micro-macro decomposition of
+[[Lemou & Mieussens 2008](#asymptotic-preserving-methods-ap--apnn)] and
+the APNN framework of
+[[Jin & Ma 2022](#asymptotic-preserving-methods-ap--apnn)], but differs
+in two key ways: (a) it is an **operator learning** model (inputs are entire
+coefficient fields, not coordinates), and (b) the AP property is enforced at
+the **architecture level** rather than purely through a loss residual.
+The closest published precedent for the radiative transfer setting is
+[[Li et al. 2022](#asymptotic-preserving-methods-ap--apnn)] (MD-APNN for
+gray radiative transfer equations), which uses the same micro-macro split but
+as a PINN solving a single fixed instance rather than learning an operator.
+
+### Known limitations
+
+- **Missing ε normalisation.** The literature defines the micro variable as
+  `g = (I − ρ)/ε` so it stays O(1) as ε → 0. This model uses `R = I − I_P1`
+  without the ε denominator, so R shrinks toward zero in the diffusion regime
+  and the MicroNet receives diminishing gradient signal there.
+- **MacroNet is grid-tied.** The FNO backbone requires a fixed spatial
+  resolution, so the macro part does not transfer across resolutions out of the
+  box (MicroNet does, being a pure MLP queried at arbitrary points).
+- **P1 is a poor starting point in voids.** In the Kobayashi void-duct problems
+  the solution is highly anisotropic and P1 reconstruction can be negative in
+  some directions, placing a larger burden on R.
 
 ---
 
