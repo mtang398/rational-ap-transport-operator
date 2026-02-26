@@ -696,24 +696,6 @@ tools. Brief explanations are included so it is clear why each reference matters
 
 ---
 
-### Rational activation functions
-
-- **Rational activations library**
-  Boullé, N., Nakatsukasa, Y., Townsend, A. *Rational Neural Networks.*
-  NeurIPS 2020. https://arxiv.org/abs/2004.01902
-  → Theoretical paper showing that rational functions approximate smooth
-  targets exponentially faster than ReLU networks; motivates replacing fixed
-  nonlinearities with trainable rationals in the transport operator.
-
-- **`rational_activations` PyTorch library**
-  Delfosse, T., Schmerling, P., Kerber, P., et al. *Recurrent Rational Networks.*
-  https://github.com/ml-research/rational_activations (2021).
-  → The specific library (`from rational.torch import Rational`) used in
-  Task 6. Implements Padé-type rational activations as `nn.Module` with
-  trainable numerator/denominator coefficients.
-
----
-
 ### Reference solvers
 
 - **OpenMC Monte Carlo transport**
@@ -729,34 +711,3 @@ tools. Brief explanations are included so it is clear why each reference matters
   → The SN solver interfaced in `src/solvers/opensn_interface.py`, intended
   for generating reference Kobayashi and C5G7-TD flux solutions once installed
   under WSL2/Linux.
-
----
-
-### Supporting libraries and tools
-
-- **PyTorch**
-  Paszke, A., Gross, S., Massa, F., et al. *PyTorch: An Imperative Style,
-  High-Performance Deep Learning Library.* NeurIPS 2019.
-  https://arxiv.org/abs/1912.01703
-  → Core deep learning framework for all model implementations.
-
-- **Hydra configuration framework**
-  Yadan, O. *Hydra — A Framework for Elegantly Configuring Complex Applications.*
-  GitHub (2019). https://github.com/facebookresearch/hydra
-  → Used for all config composition, CLI overrides, and sweep management.
-
-- **einops**
-  Rogozhnikov, A. *Einops: Clear and Reliable Tensor Manipulations with
-  Einstein-like Notation.* ICLR 2022. https://arxiv.org/abs/2011.04674
-  → Used for readable tensor reshaping in the model forward passes.
-
-- **h5py / HDF5**
-  Collette, A. *Python and HDF5.* O'Reilly, 2013.
-  https://www.h5py.org
-  → Default data storage backend on Windows (`src/data/io.py`); avoids the
-  atomic-rename `PermissionError` that affects Zarr on Windows.
-
-- **zarr**
-  Miles, A., et al. *Zarr: An implementation of chunked, compressed,
-  N-dimensional arrays for Python.* https://zarr.readthedocs.io
-  → Data storage backend on Linux/macOS (`src/data/io.py`).
