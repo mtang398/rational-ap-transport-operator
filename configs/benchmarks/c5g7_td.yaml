@@ -1,0 +1,15 @@
+name: c5g7_td
+spatial_shape: [51, 51]
+n_omega_train: 8
+n_groups: 7
+n_samples_train: 200
+n_samples_val: 50
+n_samples_test: 50
+epsilon_range: [0.01, 1.0]
+solver: point_kinetics
+raw_dir: null
+time_dependent: true
+n_time: 20
+t_end: 1.0
+td_config: td1
+kinetics_model: point_kinetics_6group

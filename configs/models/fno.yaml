@@ -1,0 +1,10 @@
+name: fno
+fno_channels: 32
+n_fno_blocks: 4
+n_modes: 12
+query_head_hidden: [128, 128]
+n_freq_x: 16
+n_freq_omega: 8
+activation: gelu
+time_dependent: false
+n_bc_faces: 4

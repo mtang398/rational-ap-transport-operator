@@ -1,0 +1,16 @@
+name: pinte2009
+spatial_shape: [32, 32]
+n_omega_train: 16
+n_groups: 1
+n_samples_train: 150
+n_samples_val: 40
+n_samples_test: 40
+epsilon_range: [0.001, 0.1]
+solver: lambda_iteration
+raw_dir: null
+time_dependent: false
+wavelength_um: 1.0
+L_star_Lsun: 47.0
+T_eff_K: 9500.0
+R_in_AU: 100.0
+R_out_AU: 300.0

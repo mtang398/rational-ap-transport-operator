@@ -1,0 +1,13 @@
+name: c5g7
+spatial_shape: [51, 51]
+n_omega_train: 8
+n_groups: 7
+n_samples_train: 200
+n_samples_val: 50
+n_samples_test: 50
+epsilon_range: [0.01, 1.0]
+solver: diffusion_approx
+raw_dir: null
+time_dependent: false
+domain_size_cm: 64.26
+geometry: 2D_quarter_core

@@ -1,0 +1,24 @@
+defaults:
+  - benchmark: c5g7
+  - model: ap_micromacro
+  - _self_
+
+checkpoint: runs/c5g7_ap_micromacro_seed42/checkpoints/best.pt
+protocol: all  # sn_transfer | resolution_transfer | regime_sweep | all
+
+# SN transfer
+train_n_omega: 8
+test_n_omegas: [4, 8, 12, 16, 24, 32, 64]
+
+# Resolution transfer
+resolution_multipliers: [1, 2, 4]
+
+# Regime sweep
+epsilon_values: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]
+
+# Common
+batch_size: 4
+n_test_samples: 50
+output_dir: runs/eval/${benchmark.name}_${model.name}
+device: null
+seed: 42

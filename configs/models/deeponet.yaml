@@ -1,0 +1,10 @@
+name: deeponet
+n_basis: 128
+branch_hidden: [256, 256]
+trunk_hidden: [256, 256]
+cnn_channels: [32, 64, 64]
+n_freq_x: 16
+n_freq_omega: 8
+activation: silu
+time_dependent: false
+n_bc_faces: 4

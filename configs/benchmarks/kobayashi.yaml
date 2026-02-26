@@ -1,0 +1,16 @@
+name: kobayashi
+spatial_shape: [20, 20, 20]
+n_omega_train: 24
+n_groups: 1
+n_samples_train: 100
+n_samples_val: 25
+n_samples_test: 25
+epsilon_range: [0.01, 1.0]
+solver: first_flight_kernel
+raw_dir: null
+time_dependent: false
+problem: 1
+domain_size_cm: 60.0
+sigma_t_source: 0.1
+sigma_t_void: 1.0e-8
+sigma_t_absorber: 10.0

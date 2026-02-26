@@ -1,0 +1,33 @@
+defaults:
+  - benchmark: c5g7
+  - model: ap_micromacro
+  - _self_
+
+# Training hyperparameters
+lr: 1.0e-3
+weight_decay: 1.0e-4
+scheduler: cosine
+n_epochs: 100
+warmup_epochs: 5
+batch_size: 8
+grad_clip: 1.0
+use_amp: false
+use_ema: false
+ema_decay: 0.999
+
+# Logging
+log_dir: runs
+run_name: ${benchmark.name}_${model.name}_seed${seed}
+log_every: 10
+val_every: 1
+
+# Resume
+resume_from: null
+
+# System
+device: null  # auto-detect
+num_workers: 0
+seed: 42
+
+# Variable omega training (for SN transfer)
+resample_omega_range: null  # e.g. [4, 32] to randomly sample directions during training
