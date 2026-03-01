@@ -261,7 +261,7 @@ pytest tests/ -v
 - Kovachki et al. *Neural Operator: Learning Maps Between Function Spaces.* JMLR 24(89) (2023). https://arxiv.org/abs/2108.08481
 
 **Asymptotic-preserving methods**
-- Jin & Ma. *Asymptotic-Preserving Neural Networks for Multiscale Kinetic Equations.* CiCP 31(5) (2022). https://doi.org/10.4208/cicp.OA-2021-0166
+- Jin, Ma & Wu. *Asymptotic-Preserving Neural Networks for Multiscale Kinetic Equations.* arXiv:2306.15381 (2023). https://arxiv.org/abs/2306.15381
 - Lemou & Mieussens. *A New AP Scheme Based on Micro-Macro Formulation.* SIAM J. Sci. Comput. 31(1) (2008). https://doi.org/10.1137/07069479X
 - Jin. *Efficient AP Schemes for Multiscale Kinetic Equations.* SIAM J. Sci. Comput. 21(2) (1999). https://doi.org/10.1137/S1064827598334599
 
