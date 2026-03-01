@@ -287,7 +287,7 @@ class C5G7Converter:
     Converts C5G7 MOX benchmark to canonical TransportSample format.
 
     When raw data is absent: uses the published quarter-core geometry
-    (full 17×17 pin lattice per assembly, all 6 materials with exact XS)
+    (full 17×17 pin lattice per assembly, all 7 materials with exact XS)
     and solves for flux with a diffusion approximation.  The geometry,
     material distribution and cross sections are exactly as published.
     Only the flux field is approximate (diffusion, not SN).
