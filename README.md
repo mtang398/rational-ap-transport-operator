@@ -4,7 +4,7 @@ A PyTorch research codebase for learning the **solution operator of radiative/pa
 
 > **T : (σ_a, σ_s, q, BC, ε, g) → I(x, ω)**
 
-The model is queried at arbitrary spatial points **x** and angular directions **ω** at evaluation time — no retraining when the discretization changes.
+The model is queried at arbitrary angular directions **ω** at evaluation time — no retraining when the SN order changes. Spatial queries must correspond to the structured grid ordering used during training (the FNO backbone operates on a fixed [H, W] grid).
 
 ---
 
@@ -57,7 +57,7 @@ This is the leading-order Chapman-Enskog term; it integrates to give φ exactly 
 
 **Loss** = intensity L2 + moment consistency (quadrature moments of predicted I must agree with MacroNet's direct φ, J predictions) + ε-weighted diffusion regularization (extra gradient signal when ε is small).
 
-The diffusion limit is **exact by construction**: as ε → 0, R → 0 and the model reduces to a diffusion solver. MacroNet only needs to learn the diffusion equation rather than discovering the limit from data. This design follows the micro-macro decomposition of Lemou & Mieussens (2008) and the APNN framework of Jin & Ma (2022), extended from single-instance PINNs to full operator learning over coefficient fields.
+The diffusion limit is **encouraged by construction**: as ε → 0, the loss applies an explicit (1−ε)-weighted penalty on R² that drives R toward zero, and R is zero-initialized. This is a soft constraint, not a hard architectural guarantee — but in practice it gives the model a strong inductive bias toward the diffusion limit. MacroNet only needs to learn the diffusion equation rather than discovering the limit from data. This design follows the micro-macro decomposition of Lemou & Mieussens (2008) and the APNN framework of Jin & Ma (2022), extended from single-instance PINNs to full operator learning over coefficient fields.
 
 ---
 
@@ -81,9 +81,9 @@ Implemented in [`src/models/deeponet.py`](src/models/deeponet.py).
 
 ### C5G7 — 2D Nuclear Criticality Eigenvalue
 
-The OECD/NEA C5G7 benchmark: a 2D quarter-core PWR with 6 materials (UO2, MOX 4.3/7.0/8.7%, guide tube, fission chamber, moderator) on a 51×51 spatial grid, 7 neutron energy groups.
+The OECD/NEA C5G7 benchmark: a 2D quarter-core PWR with 7 materials (UO2, MOX 4.3/7.0/8.7%, guide tube, fission chamber, moderator) on a 51×51 spatial grid, 7 neutron energy groups.
 
-**Ground truth**: real OpenMC Monte Carlo eigenvalue flux (5 M active particle histories per sample, ~0.7% flux uncertainty). Each sample runs a fully independent OpenMC simulation with its own perturbed cross-section library.
+**Ground truth**: real OpenMC Monte Carlo eigenvalue scalar flux φ(x) (5 M active particle histories per sample, ~0.7% flux uncertainty). Each sample runs a fully independent OpenMC simulation with its own perturbed cross-section library. The angular intensity I(x,ω) is **P1-reconstructed** from φ and the Fick current J_Fick = −D∇φ — it is not a direct MC angular tally.
 
 **What varies per sample** (out of T : (σ_a, σ_s, q, BC, ε, g) → I):
 
