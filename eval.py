@@ -3,18 +3,19 @@ Evaluation entry point.
 
 Loads a checkpoint and runs evaluation protocols:
   - test_set:            baseline metrics on the held-out test split (I, phi, J)
-  - sn_transfer:         evaluate at unseen angular discretizations
+  - omega_transfer:      evaluate at unseen direction counts (Nω sweep)
+  - sn_transfer:         backward-compatible alias for omega_transfer
   - resolution_transfer: evaluate at finer spatial grids (bilinear-interpolated targets)
   - regime_sweep:        evaluate across epsilon values (NOT supported for c5g7)
   - all:                 run all supported protocols for the benchmark
 
 Protocol support by benchmark
 ------------------------------
-  c5g7      : test_set, sn_transfer, resolution_transfer
+  c5g7      : test_set, omega_transfer, resolution_transfer
               (regime_sweep is skipped — C5G7 is a fixed k-eigenvalue problem;
                epsilon is not a physical parameter of the OpenMC simulation,
                so a regime sweep would not test genuine transport-regime variation)
-  pinte2009 : test_set, sn_transfer, resolution_transfer, regime_sweep
+  pinte2009 : test_set, omega_transfer, resolution_transfer, regime_sweep
 
 Saves per-protocol CSVs, metrics.json, and summary.csv.
 
@@ -38,7 +39,7 @@ from src.utils.seed import set_seed
 from src.utils.io_utils import save_json, save_csv
 from src.eval.protocols import (
     TestSetProtocol,
-    SNTransferProtocol,
+    OmegaTransferProtocol,
     ResolutionTransferProtocol,
     RegimeSweepProtocol,
 )
@@ -69,8 +70,9 @@ def parse_args():
     p.add_argument("--benchmark", default="c5g7", choices=list(BENCHMARK_DEFAULTS.keys()))
     p.add_argument("--model", default="ap_micromacro", choices=["fno", "deeponet", "ap_micromacro"])
     p.add_argument("--protocol", default="all",
-                   choices=["test_set", "sn_transfer", "resolution_transfer", "regime_sweep", "all"])
-    # SN transfer
+                   choices=["test_set", "omega_transfer", "sn_transfer",
+                            "resolution_transfer", "regime_sweep", "all"])
+    # Omega transfer (sn_transfer is a backward-compatible alias)
     p.add_argument("--train_n_omega", type=int, default=8)
     p.add_argument("--test_n_omegas", type=int, nargs="+", default=[4, 8, 12, 16, 24, 32, 64])
     # Resolution transfer
@@ -228,10 +230,11 @@ def main():
         all_results["test_set"] = ts_results
         logger.info(f"Test set results saved to: {ts_csv}")
 
-    # --- SN Transfer ---
-    if args.protocol in ("sn_transfer", "all"):
-        logger.info("Running SN transfer protocol...")
-        sn_proto = SNTransferProtocol(
+    # --- Omega Transfer (direction-count / Nω sweep) ---
+    # "sn_transfer" is a backward-compatible alias that writes sn_transfer.csv.
+    if args.protocol in ("omega_transfer", "sn_transfer", "all"):
+        logger.info("Running omega (direction-count) transfer protocol...")
+        omega_proto = OmegaTransferProtocol(
             model=model,
             test_samples=test_samples,
             train_n_omega=args.train_n_omega,
@@ -239,11 +242,17 @@ def main():
             device=str(device),
             batch_size=args.batch_size,
         )
-        sn_results = sn_proto.run()
-        sn_csv = str(output_dir / "sn_transfer.csv")
-        sn_proto.to_csv(sn_results, sn_csv)
-        all_results["sn_transfer"] = sn_results
-        logger.info(f"SN transfer results saved to: {sn_csv}")
+        omega_results = omega_proto.run()
+        # Canonical output file is omega_transfer.csv; sn_transfer alias writes
+        # sn_transfer.csv so old run directories remain readable.
+        if args.protocol == "sn_transfer":
+            csv_stem = "sn_transfer"
+        else:
+            csv_stem = "omega_transfer"
+        omega_csv = str(output_dir / f"{csv_stem}.csv")
+        omega_proto.to_csv(omega_results, omega_csv)
+        all_results["omega_transfer"] = omega_results
+        logger.info(f"Omega transfer results saved to: {omega_csv}")
 
     # --- Resolution Transfer ---
     if args.protocol in ("resolution_transfer", "all"):

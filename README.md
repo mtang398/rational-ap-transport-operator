@@ -4,7 +4,7 @@ A PyTorch research codebase for learning the **solution operator of radiative/pa
 
 > **T : (σ_a, σ_s, q, BC, ε, g) → I(x, ω)**
 
-The model is queried at arbitrary angular directions **ω** at evaluation time — no retraining when the SN order changes. Spatial queries must correspond to the structured grid ordering used during training (the FNO backbone operates on a fixed [H, W] grid).
+The model is queried at arbitrary angular directions **ω** at evaluation time — no retraining when the direction count Nω changes. Spatial queries must correspond to the structured grid ordering used during training (the FNO backbone operates on a fixed [H, W] grid).
 
 ---
 
@@ -14,7 +14,7 @@ The goal is to develop and evaluate an **asymptotic-preserving, discretization-a
 
 The central scientific question is whether **trainable rational activation functions** materially improve generalization across three axes relative to standard activations (ReLU/GELU/SiLU):
 
-1. **SN order transfer** — trained on S8, evaluated on S4 / S16 / S32 / S64
+1. **Direction-count transfer (Nω sweep)** — trained on Nω=8, evaluated on Nω=4 / 16 / 32 / 64; we use a 2D uniform-azimuth quadrature with Nω equally spaced angles and equal weights
 2. **Spatial resolution transfer** — trained at base resolution, evaluated at 2× / 4× finer grids
 3. **Cross-regime (ε sweep)** — trained across ε ∈ [0.01, 1], evaluated at ε → 0 (diffusion limit) and ε = 1 (transport limit)
 
@@ -92,7 +92,7 @@ The OECD/NEA C5G7 benchmark: a 2D quarter-core PWR with 7 materials (UO2, MOX 4.
 | σ_a (absorption) | ✅ **Varies** | ×U[0.9, 1.1] independently per material per energy group (7 materials × 7 groups = 49 independent scalars) |
 | σ_s (scattering) | ✅ **Varies** | ×U[0.9, 1.1] independently per material per group, drawn independently of σ_a |
 | q / ν·σ_f (fission source) | ✅ **Varies** | ×U[0.9, 1.1] per material per group (eigenvalue problem — fission source is derived from ν·σ_f, not an independent q) |
-| BC | ❌ **Fixed** | Vacuum (zero incoming flux) on all four sides — fixed by the C5G7 benchmark definition |
+| BC | ❌ **Fixed** | Quarter-domain with reflecting BCs on the two symmetry planes and vacuum BCs on the two outer boundaries (per the OECD/NEA C5G7 MOX benchmark) |
 | ε | ❌ **Not physical** | Stored as a model-input label but **does not affect the OpenMC simulation**. Physics is identical across all ε labels. Regime sweep is therefore skipped for C5G7. |
 | g (anisotropy) | ❌ **Fixed** | 0 (isotropic scattering) — fixed by the C5G7 benchmark definition |
 | Geometry | ❌ **Fixed** | 51×51 quarter-core pin layout — fixed by the C5G7 benchmark definition |
@@ -180,7 +180,8 @@ python eval.py \
 | Protocol | What it tests | Benchmarks |
 |---|---|---|
 | `test_set` | Held-out test split at training resolution | Both |
-| `sn_transfer` | Generalization to unseen SN orders (S4 → S64) | Both |
+| `omega_transfer` | Direction-count transfer: Nω=4 / 8 / 16 / 32 / 64 (uniform-azimuth quadrature) | Both |
+| `sn_transfer` | Backward-compatible alias for `omega_transfer` | Both |
 | `resolution_transfer` | Generalization to 2×/4× finer spatial grids (bilinear-interpolated targets) | Both |
 | `regime_sweep` | Generalization across ε ∈ [0.001, 5.0] | Pinte 2009 only |
 

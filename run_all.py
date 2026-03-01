@@ -10,14 +10,14 @@ Usage:
 Output:
     runs/aggregate/all_results.csv       ← THE paper table (all models x benchmarks x protocols)
     runs/eval/<run>/test_set.csv
-    runs/eval/<run>/sn_transfer.csv
+    runs/eval/<run>/omega_transfer.csv   ← angular direction-count transfer (Nω sweep)
     runs/eval/<run>/resolution_transfer.csv
     runs/eval/<run>/regime_sweep.csv     ← pinte2009 only
     runs/<run>/checkpoints/best.pt
 
 Protocol support by benchmark:
-    c5g7      : test_set, sn_transfer, resolution_transfer
-    pinte2009 : test_set, sn_transfer, resolution_transfer, regime_sweep
+    c5g7      : test_set, omega_transfer, resolution_transfer
+    pinte2009 : test_set, omega_transfer, resolution_transfer, regime_sweep
 """
 
 from __future__ import annotations
@@ -169,7 +169,9 @@ def step_aggregate():
     """Collect every per-run CSV into runs/aggregate/all_results.csv."""
     # Files to skip — these are derived/summary outputs, not primary protocol CSVs
     SKIP_STEMS = {"summary", "all_results"}
-    PROTOCOL_STEMS = {"test_set", "sn_transfer", "resolution_transfer", "regime_sweep"}
+    # "sn_transfer" is kept as backward-compatible alias for "omega_transfer".
+    # Both map to the canonical "omega_transfer" protocol in the aggregate table.
+    PROTOCOL_STEMS = {"test_set", "omega_transfer", "sn_transfer", "resolution_transfer", "regime_sweep"}
 
     agg_rows = []
     for csv_path in glob.glob("runs/eval/**/*.csv", recursive=True):
@@ -177,7 +179,8 @@ def step_aggregate():
         if p.stem in SKIP_STEMS or p.stem not in PROTOCOL_STEMS:
             continue
         run_id  = p.parent.name          # e.g. c5g7_ap_micromacro
-        protocol = p.stem                 # e.g. sn_transfer
+        # Normalize alias: sn_transfer.csv is treated as omega_transfer
+        protocol = "omega_transfer" if p.stem == "sn_transfer" else p.stem
         # Parse run_id → benchmark and model
         # Convention: run_id = {benchmark}_{model}
         parts = run_id.split("_")
@@ -242,7 +245,7 @@ def _print_summary(rows: list[dict]):
         except (ValueError, TypeError):
             pass
 
-    protocols = ["test_set", "sn_transfer", "resolution_transfer", "regime_sweep"]
+    protocols = ["test_set", "omega_transfer", "resolution_transfer", "regime_sweep"]
     col_w = 22
     header = f"{'Benchmark':<22} {'Model':<18} " + "  ".join(f"{p:<{col_w}}" for p in protocols)
     print(header)
@@ -393,10 +396,10 @@ def main():
             if not ok:
                 failed.append(f"eval:test_set:{bm}:{mdl}")
 
-            # SN transfer (all benchmarks)
-            ok = step_eval(bm, mdl, ckpt, "sn_transfer", n_test, batch, extra)
+            # Omega transfer / direction-count Nω sweep (all benchmarks)
+            ok = step_eval(bm, mdl, ckpt, "omega_transfer", n_test, batch, extra)
             if not ok:
-                failed.append(f"eval:sn_transfer:{bm}:{mdl}")
+                failed.append(f"eval:omega_transfer:{bm}:{mdl}")
 
             # Resolution transfer (all benchmarks)
             ok = step_eval(bm, mdl, ckpt, "resolution_transfer", n_test, batch, extra)
@@ -428,7 +431,7 @@ def main():
     log.info("\nKey output files:")
     log.info("  runs/aggregate/all_results.csv       ← paper table")
     log.info("  runs/eval/*/test_set.csv             ← held-out test performance")
-    log.info("  runs/eval/*/sn_transfer.csv          ← angular discretization transfer")
+    log.info("  runs/eval/*/omega_transfer.csv       ← direction-count transfer (Nω sweep)")
     log.info("  runs/eval/*/resolution_transfer.csv  ← spatial resolution transfer")
     log.info("  runs/eval/*/regime_sweep.csv         ← epsilon sweep (pinte2009 only)")
 

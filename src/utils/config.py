@@ -85,7 +85,7 @@ class TrainConfig:
 @dataclass
 class EvalConfig:
     checkpoint: str = "runs/latest.pt"
-    protocol: str = "all"  # "sn_transfer", "resolution_transfer", "regime_sweep", "all"
+    protocol: str = "all"  # "omega_transfer", "sn_transfer" (alias), "resolution_transfer", "regime_sweep", "all"
     # SN transfer
     train_n_omega: int = 8
     test_n_omegas: List[int] = field(default_factory=lambda: [4, 8, 16, 32, 64])

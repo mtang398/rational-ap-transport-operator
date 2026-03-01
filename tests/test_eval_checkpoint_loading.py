@@ -237,7 +237,7 @@ def test_eval_all_protocols(benchmark, model_name, tmp_path):
     from src.data.io import ZarrDatasetWriter
     from src.eval.protocols import (
         TestSetProtocol,
-        SNTransferProtocol,
+        OmegaTransferProtocol,
         ResolutionTransferProtocol,
         RegimeSweepProtocol,
     )
@@ -287,8 +287,8 @@ def test_eval_all_protocols(benchmark, model_name, tmp_path):
         assert metric in r, f"Missing {metric} in test set results"
         assert r[metric] == r[metric], f"NaN {metric} in test set results"
 
-    # --- SN Transfer ---
-    sn = SNTransferProtocol(
+    # --- Omega Transfer (direction-count / Nω sweep) ---
+    sn = OmegaTransferProtocol(
         model=model,
         test_samples=test_samples,
         train_n_omega=bm_def["n_omega"],
@@ -297,7 +297,7 @@ def test_eval_all_protocols(benchmark, model_name, tmp_path):
         batch_size=args.batch_size,
     )
     sn_results = sn.run()
-    assert sn_results, "SN transfer returned empty results"
+    assert sn_results, "Omega transfer returned empty results"
     for nw, r in sn_results.items():
         assert "I_rel_l2" in r, f"Missing I_rel_l2 for n_omega={nw}"
         assert not (r["I_rel_l2"] != r["I_rel_l2"]), f"NaN I_rel_l2 at n_omega={nw}"

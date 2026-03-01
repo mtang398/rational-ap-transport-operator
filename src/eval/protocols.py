@@ -1,7 +1,8 @@
 """
 Evaluation protocols for transport neural operators.
 
-1. SNTransferProtocol:       evaluate at unseen angular discretizations (Nw sweep)
+1. OmegaTransferProtocol:    evaluate at unseen direction counts (Nω sweep)
+                              alias: SNTransferProtocol (backward-compatible)
 2. ResolutionTransferProtocol: evaluate at unseen spatial resolutions (x2, x4 grids)
 3. RegimeSweepProtocol:      evaluate across epsilon values (diffusive to transport)
 
@@ -163,14 +164,15 @@ class TestSetProtocol:
             writer.writerows(rows)
 
 
-# ── SN Transfer ───────────────────────────────────────────────────────────────
+# ── Omega Transfer (direction-count / Nω sweep) ───────────────────────────────
 
-class SNTransferProtocol:
+class OmegaTransferProtocol:
     """
-    SN Transfer Evaluation Protocol.
+    Direction-count (Nω) transfer evaluation protocol.
 
-    Tests discretization-agnosticism: model trained on one set of angular
-    quadratures, evaluated on different SN orders / direction counts.
+    Tests discretization-agnosticism: model trained on Nω directions, evaluated
+    at unseen direction counts.  Uses a 2D uniform-azimuth quadrature with Nω
+    equally spaced angles and equal weights; transfer means changing Nω at eval.
 
     Uses the provided test_samples (real data if available).
     Reports: I_rel_l2, phi_rel_l2, J_rel_l2 vs n_omega
@@ -197,7 +199,7 @@ class SNTransferProtocol:
 
     def run(self) -> Dict[str, Any]:
         """
-        Run SN transfer evaluation.
+        Run omega (direction-count) transfer evaluation.
 
         Returns:
             dict mapping n_omega -> aggregate metrics
@@ -206,7 +208,7 @@ class SNTransferProtocol:
         results = {}
 
         for n_omega in self.test_n_omegas:
-            logger.info(f"SN transfer: evaluating at n_omega={n_omega}")
+            logger.info(f"Omega transfer: evaluating at Nω={n_omega}")
             # Resample directions — one RNG shared across all samples so each
             # sample gets distinct angular directions.
             rng = np.random.default_rng(42)
@@ -236,7 +238,7 @@ class SNTransferProtocol:
             summary["runtime_s"] = t1 - t0
             summary["is_train_nw"] = (n_omega == self.train_n_omega)
             results[n_omega] = summary
-            logger.info(f"  n_omega={n_omega}: I_rel_l2={summary.get('I_rel_l2', float('nan')):.4e}")
+            logger.info(f"  Nω={n_omega}: I_rel_l2={summary.get('I_rel_l2', float('nan')):.4e}")
 
         return results
 
@@ -249,6 +251,10 @@ class SNTransferProtocol:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
+
+
+# Backward-compatible alias
+SNTransferProtocol = OmegaTransferProtocol
 
 
 # ── Resolution Transfer ───────────────────────────────────────────────────────
