@@ -252,8 +252,8 @@ pytest tests/ -v
 ## Citations
 
 **Benchmarks**
-- OECD/NEA. *Benchmark on Deterministic Transport Calculations Without Spatial Homogenisation.* NEA/NSC/DOC(2003)16. (C5G7)
-- Pinte et al. *Benchmark problems for continuum radiative transfer.* A&A 498, 967–980 (2009). https://doi.org/10.1051/0004-6361/200811474
+- OECD/NEA. *Benchmark on Deterministic Transport Calculations Without Spatial Homogenisation.* NEA/NSC/DOC(2003)16. https://www.oecd-nea.org/jcms/pl_13548
+- Pinte et al. *Benchmark problems for continuum radiative transfer.* A&A 498, 967–980 (2009). https://doi.org/10.1051/0004-6361/200811555
 
 **Neural operators**
 - Li et al. *Fourier Neural Operator for Parametric PDEs.* ICLR 2021. https://arxiv.org/abs/2010.08895
