@@ -20,7 +20,6 @@ from typing import Optional, List, Dict, Any
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
 
 from .common import (
@@ -106,6 +105,7 @@ class BranchNet(nn.Module):
         bc: Tensor,
         params: Tensor,
         spatial_shape: List[int],
+        batch_param_keys: Optional[List[str]] = None,
     ) -> Tensor:
         """
         Args:
@@ -113,6 +113,7 @@ class BranchNet(nn.Module):
             bc: [B, n_bc_faces, 2]
             params: [B, n_params]
             spatial_shape: list of spatial dims
+            batch_param_keys: key names for each column of params
 
         Returns:
             coefficients: [B, n_basis]
@@ -131,8 +132,8 @@ class BranchNet(nn.Module):
 
         cnn_out = self.cnn(fields_grid).flatten(1)  # [B, cnn_out_dim]
 
-        bc_feat = self.bc_encoder(bc.reshape(B, -1))  # [B, 32]
-        param_feat = self.param_enc(params)             # [B, 32]
+        bc_feat = self.bc_encoder(bc.reshape(B, -1))              # [B, 32]
+        param_feat = self.param_enc(params, batch_param_keys)     # [B, 32]
 
         combined = torch.cat([cnn_out, bc_feat, param_feat], dim=-1)  # [B, total_in]
         return self.proj(combined)  # [B, n_basis]
@@ -171,9 +172,14 @@ class TrunkNet(nn.Module):
             self.t_enc = FourierFeatures(1, n_freq=8, sigma=0.5)
             in_dim += self.t_enc.out_dim
 
-        # Output: n_basis * n_groups (one trunk vector per output channel)
+        # Output: n_basis * n_groups (one trunk vector per output channel).
+        # No final activation: the trunk outputs are used as a linear basis and must
+        # be able to take both positive and negative values so that the branch-trunk
+        # inner product (before softplus) can span a symmetric range around zero.
+        # A final SiLU would clip negative values to ≈0, biasing the inner product
+        # positive and reducing the effective rank of the trunk basis.
         self.net = MLP(in_dim, n_basis * n_groups, hidden_dims, activation=activation,
-                       final_activation=True)
+                       final_activation=False)
 
     def forward(
         self,
@@ -260,8 +266,11 @@ class DeepONetTransport(nn.Module):
             time_dependent=time_dependent,
         )
 
-        # Output bias per group
+        # Per-group output bias (learnable).
         self.bias = nn.Parameter(torch.zeros(n_groups))
+        # 1/sqrt(n_basis) keeps the branch-trunk inner product O(1) at init
+        # regardless of n_basis (standard Xavier-style scaling for dot products).
+        self._inner_prod_scale = n_basis ** -0.5
 
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Tensor]:
         """
@@ -275,6 +284,7 @@ class DeepONetTransport(nn.Module):
         q = batch["q"]
         bc = batch["bc"]
         params = batch["params"]
+        param_keys = batch.get("param_keys")
         x = batch["x"]
         omega = batch["omega"]
         w_omega = batch["w_omega"]
@@ -286,7 +296,7 @@ class DeepONetTransport(nn.Module):
         Nw = omega.shape[1]
 
         # Branch: [B, n_basis]
-        branch_out = self.branch(sigma_a, sigma_s, q, bc, params, spatial_shape)
+        branch_out = self.branch(sigma_a, sigma_s, q, bc, params, spatial_shape, batch_param_keys=param_keys)
 
         # Trunk: [B, Nx, Nw, n_basis * G]
         trunk_out = self.trunk(x, omega, t, omega_mask)
@@ -294,12 +304,11 @@ class DeepONetTransport(nn.Module):
         # Reshape trunk: [B, Nx, Nw, n_basis, G]
         trunk_out = trunk_out.reshape(B, Nx, Nw, self.n_basis, G)
 
-        # Inner product: sum over basis
-        # branch: [B, n_basis] -> [B, 1, 1, n_basis, 1]
+        # Inner product: sum over basis, scaled by 1/sqrt(n_basis) so the
+        # result stays O(1) regardless of n_basis (prevents dead-softplus collapse).
         branch_exp = branch_out.view(B, 1, 1, self.n_basis, 1)
-        I = (branch_exp * trunk_out).sum(dim=3)  # [B, Nx, Nw, G]
+        I = (branch_exp * trunk_out).sum(dim=3) * self._inner_prod_scale  # [B, Nx, Nw, G]
         I = I + self.bias.view(1, 1, 1, G)
-        I = F.softplus(I)  # positivity
 
         if omega_mask is not None:
             mask = omega_mask.unsqueeze(1).unsqueeze(-1).float()

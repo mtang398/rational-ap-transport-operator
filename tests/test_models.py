@@ -23,6 +23,7 @@ def make_batch(spatial_shape=(8, 8), n_omega=4, n_groups=1, batch_size=2, dim=2)
         n_omega=n_omega,
         n_groups=n_groups,
         seed=42,
+        solver_name="mock",   # always use analytic mock in unit tests
     )
     loader = DataLoader(ds, batch_size=batch_size, collate_fn=collate_fn)
     return next(iter(loader))

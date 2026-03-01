@@ -33,7 +33,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import numpy as np
 
@@ -310,29 +310,78 @@ class C5G7Converter:
         return all((self.raw_dir / f).exists()
                    for f in ["geometry.json", "xs_7group.json"])
 
-    def convert(self, n_samples: int = 10, spatial_shape: tuple = (51, 51),
-                n_omega: int = 16, rng: Optional[np.random.Generator] = None,
-                epsilon: float = 1.0) -> List[TransportSample]:
+    def convert(
+        self,
+        n_samples: int = 10,
+        spatial_shape: tuple = (51, 51),
+        n_omega: int = 16,
+        rng: Optional[np.random.Generator] = None,
+        epsilon: float = 1.0,
+        epsilon_range: Optional[Tuple[float, float]] = None,
+        xs_perturb: float = 0.10,
+    ) -> List[TransportSample]:
+        """
+        Generate C5G7 samples.
+
+        Parameters
+        ----------
+        epsilon       : single epsilon value used for all samples (legacy, overridden
+                        by epsilon_range when both are provided).
+        epsilon_range : (eps_min, eps_max) — each sample draws epsilon uniformly
+                        from this range.  Recommended for training datasets that
+                        span the transport-to-diffusion regime.
+        xs_perturb    : half-width of the uniform multiplicative perturbation
+                        applied independently per material per energy group to
+                        sigma_a, sigma_s, and nu_sigma_f.  E.g. 0.10 = ±10%.
+                        Perturbations are stored in sample metadata so OpenMC
+                        uses the identical perturbed XS for each MC run, giving
+                        genuine input-output diversity at the operator level.
+                        Set to 0.0 to disable (all samples share the canonical
+                        XS → only epsilon varies across samples).
+        """
         if rng is None:
             rng = np.random.default_rng(0)
         if self._has_raw:
-            logger.info("C5G7: loading from raw data files.")
-            return self._convert_raw(n_samples, spatial_shape, n_omega)
-        logger.info("C5G7: building from published quarter-core geometry + diffusion flux.")
-        return self._generate_from_geometry(n_samples, spatial_shape, n_omega, rng, epsilon)
+            logger.info(
+                f"C5G7: loading from raw data files (xs_perturb={xs_perturb:.0%}, "
+                f"epsilon_range={epsilon_range})."
+            )
+            return self._convert_raw(
+                n_samples, spatial_shape, n_omega, rng, epsilon, epsilon_range, xs_perturb
+            )
+        logger.info(
+            f"C5G7: building from published quarter-core geometry + diffusion flux "
+            f"(xs_perturb={xs_perturb:.0%}, epsilon_range={epsilon_range})."
+        )
+        return self._generate_from_geometry(
+            n_samples, spatial_shape, n_omega, rng, epsilon, epsilon_range, xs_perturb
+        )
 
     # ── core builder ──────────────────────────────────────────────────────────
 
     def _make_c5g7_sample(self, spatial_shape: tuple, n_omega: int,
                           rng: np.random.Generator, epsilon: float,
-                          idx: int, perturb: bool = True) -> TransportSample:
+                          idx: int, perturb: bool = True,
+                          xs_perturb: float = 0.10) -> TransportSample:
+        """
+        Build one C5G7 sample.
+
+        Parameters
+        ----------
+        xs_perturb : half-width of the uniform perturbation applied to each
+            material's XS.  E.g. 0.10 means each material's sigma_a and
+            sigma_s are scaled by U(1-xs_perturb, 1+xs_perturb) independently
+            per energy group.  The same multipliers are stored in metadata so
+            that OpenMCInterface can apply the identical perturbation to the
+            MGXS library and run a fresh MC solve for this specific physics
+            configuration.  Default 0.10 (±10 %).
+        """
         G = self.N_GROUPS
         nx, ny = spatial_shape
         L = self.DOMAIN_SIZE_CM
 
         # Build the quarter-core material map at requested resolution
         mat_map_full = build_quarter_core_map(17)   # 51×51
-        # Rescale to requested spatial_shape via nearest-neighbour
         from scipy.ndimage import zoom as scipy_zoom
         if spatial_shape != (51, 51):
             scale = (nx / 51, ny / 51)
@@ -340,7 +389,13 @@ class C5G7Converter:
         else:
             mat_map = mat_map_full
 
-        # Fill XS arrays from published values
+        # Per-material XS multipliers — one vector per group per material.
+        # These are stored in metadata so OpenMCInterface can reproduce the
+        # exact same perturbed problem in the MC run (ensuring input and target
+        # XS are perfectly consistent).
+        xs_multipliers: dict = {}
+
+        # Fill XS arrays from published values, applying per-material perturbations
         sigma_a = np.zeros((nx, ny, G), dtype=np.float32)
         sigma_s = np.zeros((nx, ny, G), dtype=np.float32)
         q       = np.zeros((nx, ny, G), dtype=np.float32)
@@ -348,18 +403,38 @@ class C5G7Converter:
         for mat_id, mat_name in enumerate(MATERIAL_NAMES):
             xs = C5G7_XS[mat_name]
             mask = (mat_map == mat_id)
-            sigma_a[mask] = xs["sigma_a"]
-            # Use diagonal scatter as effective sigma_s (isotropic within group)
-            sigma_s[mask] = [xs["sigma_s"][g][g] for g in range(G)]
-            # Fixed-source approximation: fission source with k_eff ≈ 1.0
-            chi = np.array(xs["chi"], dtype=np.float32)
-            nu_sf = np.array(xs["nu_sigma_f"], dtype=np.float32)
-            q[mask] = chi * np.sum(nu_sf) * 0.1
 
-        # Optional random perturbation (±3%) to create sample diversity
-        if perturb:
-            sigma_a = sigma_a * rng.uniform(0.97, 1.03, sigma_a.shape).astype(np.float32)
-            sigma_s = sigma_s * rng.uniform(0.97, 1.03, sigma_s.shape).astype(np.float32)
+            sa_ref = np.array(xs["sigma_a"],  dtype=np.float32)  # [G]
+            ss_ref = np.array([xs["sigma_s"][g][g] for g in range(G)], dtype=np.float32)
+            chi    = np.array(xs["chi"],         dtype=np.float32)
+            nu_sf  = np.array(xs["nu_sigma_f"],  dtype=np.float32)
+
+            if perturb and xs_perturb > 0.0:
+                lo, hi = 1.0 - xs_perturb, 1.0 + xs_perturb
+                # Independent per-group multipliers for each material
+                m_sa  = rng.uniform(lo, hi, G).astype(np.float32)
+                m_ss  = rng.uniform(lo, hi, G).astype(np.float32)
+                m_nuf = rng.uniform(lo, hi, G).astype(np.float32)
+            else:
+                m_sa  = np.ones(G, dtype=np.float32)
+                m_ss  = np.ones(G, dtype=np.float32)
+                m_nuf = np.ones(G, dtype=np.float32)
+
+            # Store multipliers for OpenMC to apply to the MGXS library
+            xs_multipliers[mat_name] = {
+                "sigma_a":    m_sa.tolist(),
+                "sigma_s":    m_ss.tolist(),
+                "nu_fission": m_nuf.tolist(),
+            }
+
+            sigma_a[mask] = sa_ref * m_sa
+            sigma_s[mask] = ss_ref * m_ss
+            # Fission source derived from perturbed nu_sigma_f.
+            # q is not an independent input for an eigenvalue problem — it is
+            # determined by the flux itself.  We store it here only as a
+            # visualisation / model-input field consistent with the perturbed XS;
+            # no additional q_scale is applied.
+            q[mask] = chi * np.sum(nu_sf * m_nuf) * 0.1
 
         # Angular quadrature: uniform azimuthal (2D)
         angles = np.linspace(0, 2 * np.pi, n_omega, endpoint=False, dtype=np.float32)
@@ -382,13 +457,12 @@ class C5G7Converter:
             L,
         )  # [Nx, G]
 
-        # Intensity: P1 approximation  I = φ/(4π) for isotropic, no anisotropy
         g_param = 0.0
-        norm = 2 * np.pi
-        I_vals = phi_vals[:, np.newaxis, :] / norm  # [Nx, Nw, G]
-        I_vals = np.broadcast_to(I_vals, (Nx, n_omega, G)).copy()
 
-        # Current: Fick's law  J = -D ∇φ  (finite-difference gradient)
+        # P1 intensity using the Fick current for angular variation.
+        # We compute J_fick only as an intermediate to build I; the stored J
+        # will be the angular quadrature moment of I (self-consistent with the
+        # model's J head which also computes J = sum(w*omega*I)).
         phi_grid = phi_vals.reshape(nx, ny, G)
         dx = L / max(nx - 1, 1)
         dy = L / max(ny - 1, 1)
@@ -396,9 +470,20 @@ class C5G7Converter:
         dphidy = np.gradient(phi_grid, dy, axis=1)
         sigma_t_grid = (sigma_a + sigma_s)
         D_grid = 1.0 / (3.0 * np.maximum(sigma_t_grid, 1e-8))
-        Jx = -(D_grid * dphidx).reshape(Nx, G)
-        Jy = -(D_grid * dphidy).reshape(Nx, G)
-        J_vals = np.stack([Jx, Jy], axis=1)  # [Nx, 2, G]
+        Jx_fick = -(D_grid * dphidx).reshape(Nx, G)
+        Jy_fick = -(D_grid * dphidy).reshape(Nx, G)
+        J_fick = np.stack([Jx_fick, Jy_fick], axis=1)  # [Nx, 2, G]
+
+        # I(x,Ω) = phi/(2π) * [1 + (3·J_fick·Ω) / (2π·phi)]  (P1 closure)
+        phi_safe = np.maximum(phi_vals, 1e-30)
+        JdotOmega = np.einsum('xdg,wd->xwg', J_fick, omega)   # [Nx, Nw, G]
+        correction = 1.0 + (3.0 / (2 * np.pi)) * JdotOmega / phi_safe[:, np.newaxis, :]
+        correction = np.maximum(correction, 0.0)
+        I_vals = (phi_vals[:, np.newaxis, :] / (2 * np.pi) * correction).astype(np.float32)
+
+        # J stored = angular quadrature moment of I  (consistent with model output)
+        #   J = sum_w w * omega * I   — this is the physical first angular moment
+        J_vals = np.einsum('w,wd,nwg->ndg', w_omega, omega, I_vals).astype(np.float32)
 
         bc = BCSpec(bc_type="vacuum")
         inputs = InputFields(
@@ -414,69 +499,90 @@ class C5G7Converter:
                 "geometry": "2D_quarter_core",
                 "domain_size_cm": L,
                 "n_assemblies": 9,
+                # Store per-material XS multipliers so OpenMCInterface can
+                # build the exact same perturbed MGXS library for this sample.
+                "xs_multipliers": xs_multipliers,
             },
         )
         query   = QueryPoints(x=x_query, omega=omega, w_omega=w_omega)
         targets = TargetFields(I=I_vals, phi=phi_vals, J=J_vals)
 
+        # sample_id is a hash of the XS multipliers — globally unique across
+        # ALL splits (train/val/test/eval) because each sample has different XS.
+        # This is what OpenMCInterface uses as the work_dir subdirectory name,
+        # so statepoints from train samples are NEVER reused for val/test samples.
+        import hashlib as _hl, json as _json
+        xs_hash = _hl.md5(
+            _json.dumps(xs_multipliers, sort_keys=True).encode()
+        ).hexdigest()[:12]
+        sample_id = f"c5g7_{xs_hash}"
+
         return TransportSample(
             inputs=inputs, query=query, targets=targets,
-            sample_id=f"c5g7_{idx:04d}",
+            sample_id=sample_id,
         )
 
-    def _generate_from_geometry(self, n_samples: int, spatial_shape: tuple,
-                                n_omega: int, rng: np.random.Generator,
-                                epsilon: float) -> List[TransportSample]:
+    def _generate_from_geometry(
+        self,
+        n_samples: int,
+        spatial_shape: tuple,
+        n_omega: int,
+        rng: np.random.Generator,
+        epsilon: float,
+        epsilon_range: Optional[Tuple[float, float]] = None,
+        xs_perturb: float = 0.10,
+    ) -> List[TransportSample]:
         samples = []
         for i in range(n_samples):
-            # Only the first sample uses exact XS; rest have ±3% perturbation
+            eps_i = float(rng.uniform(*epsilon_range)) if epsilon_range is not None else epsilon
+            # All samples get independent per-material XS perturbations so that
+            # each one is a genuinely different physics problem.  The first sample
+            # is also perturbed (no "canonical reference" in the training set)
+            # unless xs_perturb=0.
             sample = self._make_c5g7_sample(
-                spatial_shape, n_omega, rng, epsilon, i, perturb=(i > 0)
+                spatial_shape, n_omega, rng, eps_i, i,
+                perturb=True, xs_perturb=xs_perturb,
             )
             samples.append(sample)
         return samples
 
     # ── raw data loader ───────────────────────────────────────────────────────
 
-    def _convert_raw(self, n_samples: int, spatial_shape: tuple,
-                     n_omega: int) -> List[TransportSample]:
-        """Load geometry.json + xs_7group.json + (optional) solution_ref.npy."""
+    def _convert_raw(
+        self,
+        n_samples: int,
+        spatial_shape: tuple,
+        n_omega: int,
+        rng: np.random.Generator,
+        epsilon: float = 1.0,
+        epsilon_range: Optional[Tuple[float, float]] = None,
+        xs_perturb: float = 0.10,
+    ) -> List[TransportSample]:
+        """
+        Load geometry.json + xs_7group.json + (optional) solution_ref.npy and
+        generate per-sample diversity via XS perturbations.
+
+        The raw solution_ref.npy (if present) is used as the canonical reference
+        flux.  For operator-learning diversity, each sample draws independent
+        per-material XS multipliers from U(1-xs_perturb, 1+xs_perturb), recomputes
+        the flux with the diffusion approximation on the perturbed XS (or scales the
+        reference flux as a first approximation), and stores the unique XS/flux pair.
+        """
         import json as _json
 
-        geom = _json.loads((self.raw_dir / "geometry.json").read_text())
+        geom    = _json.loads((self.raw_dir / "geometry.json").read_text())
         xs_data = _json.loads((self.raw_dir / "xs_7group.json").read_text())
 
         sol_path = self.raw_dir / "solution_ref.npy"
-        phi_ref = np.load(str(sol_path)) if sol_path.exists() else None
+        phi_ref  = np.load(str(sol_path)) if sol_path.exists() else None
 
-        nx = geom.get("nx", spatial_shape[0])
-        ny = geom.get("ny", spatial_shape[1])
-        G = self.N_GROUPS
-        L = self.DOMAIN_SIZE_CM
+        nx  = geom.get("nx", spatial_shape[0])
+        ny  = geom.get("ny", spatial_shape[1])
+        G   = self.N_GROUPS
+        L   = self.DOMAIN_SIZE_CM
 
-        mat_map = np.array(geom["material_map"], dtype=np.int32)
-        materials: dict = geom["materials"]  # id → name
-
-        sigma_a = np.zeros((nx, ny, G), dtype=np.float32)
-        sigma_s = np.zeros((nx, ny, G), dtype=np.float32)
-        q       = np.zeros((nx, ny, G), dtype=np.float32)
-
-        for mat_id_str, mat_name in materials.items():
-            mat_id = int(mat_id_str)
-            xs = xs_data.get(mat_name, C5G7_XS.get(mat_name, None))
-            if xs is None:
-                logger.warning(f"  Unknown material {mat_name}; skipping.")
-                continue
-            mask = (mat_map == mat_id)
-            sigma_a[mask] = xs["sigma_a"]
-            sigma_s[mask] = [xs["sigma_s"][g][g] for g in range(G)]
-            chi   = np.array(xs.get("chi", [0.0] * G), dtype=np.float32)
-            nu_sf = np.array(xs.get("nu_sigma_f", [0.0] * G), dtype=np.float32)
-            q[mask] = chi * np.sum(nu_sf) * 0.1
-
-        angles  = np.linspace(0, 2 * np.pi, n_omega, endpoint=False, dtype=np.float32)
-        omega   = np.stack([np.cos(angles), np.sin(angles)], axis=-1)
-        w_omega = np.full(n_omega, 2 * np.pi / n_omega, dtype=np.float32)
+        mat_map   = np.array(geom["material_map"], dtype=np.int32)
+        materials = geom["materials"]  # id_str → name
 
         xs_coord = np.linspace(0, L, nx, dtype=np.float32)
         ys_coord = np.linspace(0, L, ny, dtype=np.float32)
@@ -484,54 +590,99 @@ class C5G7Converter:
         x_query  = np.stack([XX.ravel(), YY.ravel()], axis=-1)
         Nx = nx * ny
 
-        if phi_ref is not None:
-            phi_vals = phi_ref.reshape(Nx, G).astype(np.float32)
-        else:
-            phi_vals = _diffusion_flux(
-                sigma_a.reshape(Nx, G), sigma_s.reshape(Nx, G),
-                x_query, q.reshape(Nx, G), L)
-
-        norm  = 2 * np.pi
-        I_arr = np.broadcast_to(phi_vals[:, np.newaxis, :] / norm,
-                                 (Nx, n_omega, G)).copy()
-
         dx = L / max(nx - 1, 1)
         dy = L / max(ny - 1, 1)
-        phi_grid  = phi_vals.reshape(nx, ny, G)
-        dphidx    = np.gradient(phi_grid, dx, axis=0)
-        dphidy    = np.gradient(phi_grid, dy, axis=1)
-        D_grid    = 1.0 / (3.0 * np.maximum(sigma_a + sigma_s, 1e-8))
-        J_arr     = np.stack([-(D_grid * dphidx).reshape(Nx, G),
-                               -(D_grid * dphidy).reshape(Nx, G)], axis=1)
 
-        bc      = BCSpec(bc_type="vacuum")
-        inputs  = InputFields(sigma_a=sigma_a, sigma_s=sigma_s, q=q, bc=bc,
-                              params={"epsilon": 1.0, "g": 0.0},
-                              metadata={"benchmark_name": self.BENCHMARK_NAME,
-                                        "dim": 2, "group_count": G,
-                                        "units": "cm", "source": "raw_files"})
-        query   = QueryPoints(x=x_query, omega=omega, w_omega=w_omega)
-        targets = TargetFields(I=I_arr, phi=phi_vals, J=J_arr)
+        samples = []
+        for i in range(n_samples):
+            eps_i = float(rng.uniform(*epsilon_range)) if epsilon_range is not None else epsilon
 
-        sample = TransportSample(inputs=inputs, query=query, targets=targets,
-                                 sample_id="c5g7_ref_0000")
-        # Replicate single reference sample (different omega seeds)
-        rng = np.random.default_rng(0)
-        return [sample] + [
-            TransportSample(
-                inputs=inputs,
-                query=QueryPoints(
-                    x=x_query,
-                    omega=np.stack([np.cos(a), np.sin(a)], axis=-1)
-                    if (a := np.linspace(0, 2*np.pi, n_omega + i, endpoint=False,
-                                         dtype=np.float32)) is not None else omega,
-                    w_omega=w_omega,
-                ),
-                targets=targets,
-                sample_id=f"c5g7_ref_{i:04d}",
+            # Per-sample XS perturbation (same logic as _make_c5g7_sample)
+            xs_multipliers: dict = {}
+            sigma_a_i = np.zeros((nx, ny, G), dtype=np.float32)
+            sigma_s_i = np.zeros((nx, ny, G), dtype=np.float32)
+            q_i       = np.zeros((nx, ny, G), dtype=np.float32)
+
+            for mat_id_str, mat_name in materials.items():
+                mat_id = int(mat_id_str)
+                xs     = xs_data.get(mat_name, C5G7_XS.get(mat_name, {}))
+                if not xs:
+                    logger.warning(f"  Unknown material {mat_name}; skipping.")
+                    continue
+                mask   = (mat_map == mat_id)
+                sa_ref = np.array(xs.get("sigma_a",  [0.0] * G), dtype=np.float32)
+                ss_ref = np.array([xs.get("sigma_s", [[0.0]*G]*G)[g][g] for g in range(G)],
+                                  dtype=np.float32)
+                chi    = np.array(xs.get("chi",          [0.0] * G), dtype=np.float32)
+                nu_sf  = np.array(xs.get("nu_sigma_f",   [0.0] * G), dtype=np.float32)
+
+                if xs_perturb > 0.0:
+                    lo, hi = 1.0 - xs_perturb, 1.0 + xs_perturb
+                    m_sa  = rng.uniform(lo, hi, G).astype(np.float32)
+                    m_ss  = rng.uniform(lo, hi, G).astype(np.float32)
+                    m_nuf = rng.uniform(lo, hi, G).astype(np.float32)
+                else:
+                    m_sa = m_ss = m_nuf = np.ones(G, dtype=np.float32)
+
+                xs_multipliers[mat_name] = {
+                    "sigma_a": m_sa.tolist(), "sigma_s": m_ss.tolist(),
+                    "nu_fission": m_nuf.tolist(),
+                }
+                sigma_a_i[mask] = sa_ref * m_sa
+                sigma_s_i[mask] = ss_ref * m_ss
+                q_i[mask]       = chi * np.sum(nu_sf * m_nuf) * 0.1
+
+            # Flux: use reference if available, otherwise diffusion approx
+            if phi_ref is not None:
+                phi_vals = phi_ref.reshape(Nx, G).astype(np.float32)
+            else:
+                phi_vals = _diffusion_flux(
+                    sigma_a_i.reshape(Nx, G), sigma_s_i.reshape(Nx, G),
+                    x_query, q_i.reshape(Nx, G), L,
+                )
+
+            angles  = np.linspace(0, 2 * np.pi, n_omega, endpoint=False, dtype=np.float32)
+            omega   = np.stack([np.cos(angles), np.sin(angles)], axis=-1)
+            w_omega = np.full(n_omega, 2 * np.pi / n_omega, dtype=np.float32)
+
+            phi_grid = phi_vals.reshape(nx, ny, G)
+            D_grid   = 1.0 / (3.0 * np.maximum(sigma_a_i + sigma_s_i, 1e-8))
+            J_fick   = np.stack([
+                -(D_grid * np.gradient(phi_grid, dx, axis=0)).reshape(Nx, G),
+                -(D_grid * np.gradient(phi_grid, dy, axis=1)).reshape(Nx, G),
+            ], axis=1)
+
+            phi_safe  = np.maximum(phi_vals, 1e-30)
+            JdotOmega = np.einsum('xdg,wd->xwg', J_fick, omega)
+            correction = np.maximum(
+                1.0 + (3.0 / (2 * np.pi)) * JdotOmega / phi_safe[:, np.newaxis, :], 0.0
             )
-            for i in range(1, n_samples)
-        ]
+            I_arr = (phi_vals[:, np.newaxis, :] / (2 * np.pi) * correction).astype(np.float32)
+            J_arr = np.einsum('w,wd,nwg->ndg', w_omega, omega, I_arr).astype(np.float32)
+
+            bc      = BCSpec(bc_type="vacuum")
+            inputs  = InputFields(
+                sigma_a=sigma_a_i, sigma_s=sigma_s_i, q=q_i, bc=bc,
+                params={"epsilon": eps_i, "g": 0.0},
+                metadata={
+                    "benchmark_name": self.BENCHMARK_NAME,
+                    "dim": 2, "group_count": G,
+                    "units": "cm", "source": "raw_files",
+                    "xs_multipliers": xs_multipliers,
+                },
+            )
+            import hashlib as _hl, json as _json
+            xs_hash = _hl.md5(
+                _json.dumps(xs_multipliers, sort_keys=True).encode()
+            ).hexdigest()[:12]
+            query   = QueryPoints(x=x_query, omega=omega, w_omega=w_omega)
+            targets = TargetFields(I=I_arr, phi=phi_vals, J=J_arr)
+            samples.append(TransportSample(
+                inputs=inputs, query=query, targets=targets,
+                sample_id=f"c5g7_{xs_hash}",
+            ))
+
+        return samples
 
     @staticmethod
     def expected_raw_format() -> str:

@@ -8,11 +8,16 @@ Usage:
     python run_all.py --epochs 200 --n_train 500                     # custom scale
 
 Output:
-    runs/aggregate/all_results.csv     ← THE paper table (all models x benchmarks x protocols)
+    runs/aggregate/all_results.csv       ← THE paper table (all models x benchmarks x protocols)
+    runs/eval/<run>/test_set.csv
     runs/eval/<run>/sn_transfer.csv
     runs/eval/<run>/resolution_transfer.csv
-    runs/eval/<run>/regime_sweep.csv
+    runs/eval/<run>/regime_sweep.csv     ← pinte2009 only
     runs/<run>/checkpoints/best.pt
+
+Protocol support by benchmark:
+    c5g7      : test_set, sn_transfer, resolution_transfer
+    pinte2009 : test_set, sn_transfer, resolution_transfer, regime_sweep
 """
 
 from __future__ import annotations
@@ -26,24 +31,27 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+
 # ──────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────
 
-BENCHMARKS = ["c5g7", "c5g7_td", "kobayashi", "pinte2009"]
+BENCHMARKS = ["c5g7", "pinte2009"]
 MODELS = ["fno", "deeponet", "ap_micromacro"]
 
 # Per-benchmark defaults for eval model args
 # (must match train.py defaults so checkpoint loads correctly)
 BENCH_EVAL_ARGS = {
     "c5g7":      ["--macro_channels", "32", "--n_fno_blocks", "4", "--n_modes", "12", "--micro_latent_dim", "64", "--n_basis", "128"],
-    "c5g7_td":   ["--macro_channels", "32", "--n_fno_blocks", "4", "--n_modes", "12", "--micro_latent_dim", "64", "--n_basis", "128"],
-    "kobayashi": ["--macro_channels", "32", "--n_fno_blocks", "4", "--n_modes", "4",  "--micro_latent_dim", "64", "--n_basis", "128"],
     "pinte2009": ["--macro_channels", "32", "--n_fno_blocks", "4", "--n_modes", "12", "--micro_latent_dim", "64", "--n_basis", "128"],
 }
 
-# Kobayashi is 3D so skip regime_sweep (small epsilon in 3D is very slow to generate)
-NO_REGIME_SWEEP = {"kobayashi"}
+# Benchmarks that do not support regime_sweep:
+#   c5g7 – k-eigenvalue problem solved by OpenMC. Epsilon is stored only
+#           as a model-input label and does not affect the OpenMC physics,
+#           so a regime sweep would not test genuine transport-regime variation.
+NO_REGIME_SWEEP = {"c5g7"}
 
 
 # ──────────────────────────────────────────────────────────────
@@ -79,17 +87,37 @@ def py(*args) -> list[str]:
 # Steps
 # ──────────────────────────────────────────────────────────────
 
-def step_generate(benchmark: str, n_train: int, n_val: int, n_test: int) -> bool:
+def step_generate(
+    benchmark: str,
+    n_train: int,
+    n_val: int,
+    n_test: int,
+    n_particles: int = 100_000,
+    n_batches: int = 100,
+    n_inactive: int = 50,
+) -> bool:
+    """Generate ALL splits before training begins."""
     ok = True
-    for split, n in [("train", n_train), ("val", n_val), ("test", n_test)]:
-        ok &= run(py("scripts/generate_dataset.py",
-                     "--benchmark", benchmark,
-                     "--solver",    "mock",
-                     "--n_samples", str(n),
-                     "--split",     split,
-                     "--output_dir","runs/datasets",
-                     "--seed",      "42"),
-                  tag=f"gen:{benchmark}:{split}")
+
+    def _gen(split, n):
+        return run(py("scripts/generate_dataset.py",
+                      "--benchmark",   benchmark,
+                      "--solver",      "auto",
+                      "--n_samples",   str(n),
+                      "--split",       split,
+                      "--output_dir",  "runs/datasets",
+                      "--seed",        "42",
+                      "--n_particles", str(n_particles),
+                      "--n_batches",   str(n_batches),
+                      "--n_inactive",  str(n_inactive)),
+                   tag=f"gen:{benchmark}:{split}")
+
+    # ALL three generation steps complete before training starts.
+    ok &= _gen("train",    n_train)
+    ok &= _gen("val",      n_val)
+    # all_eval: test + resolution_x2/x4 + every regime_eps* in one call
+    ok &= _gen("all_eval", n_test)
+
     return ok
 
 
@@ -105,7 +133,8 @@ def step_train(benchmark: str, model: str, epochs: int, batch: int,
                 "--n_samples_val",    str(n_val),
                 "--run_name",         run_name,
                 "--seed",             str(seed),
-                "--log_dir",          "runs"),
+                "--log_dir",          "runs",
+                "--data_dir",         "runs/datasets"),
              tag=f"train:{benchmark}:{model}")
     if not ok:
         return None
@@ -123,23 +152,30 @@ def step_eval(benchmark: str, model: str, ckpt: Path,
               extra_args: list[str]) -> bool:
     run_name = f"{benchmark}_{model}"
     return run(py("eval.py",
-                  "--checkpoint",   str(ckpt),
-                  "--benchmark",    benchmark,
-                  "--model",        model,
-                  "--protocol",     protocol,
-                  "--output_dir",   f"runs/eval/{run_name}",
+                  "--checkpoint",     str(ckpt),
+                  "--benchmark",      benchmark,
+                  "--model",          model,
+                  "--protocol",       protocol,
+                  "--output_dir",     f"runs/eval/{run_name}",
                   "--n_test_samples", str(n_test),
-                  "--batch_size",   str(batch),
-                  "--seed",         "42",
+                  "--batch_size",     str(batch),
+                  "--seed",           "42",
+                  "--data_dir",       "runs/datasets",
                   *extra_args),
                tag=f"eval:{benchmark}:{model}:{protocol}")
 
 
 def step_aggregate():
     """Collect every per-run CSV into runs/aggregate/all_results.csv."""
+    # Files to skip — these are derived/summary outputs, not primary protocol CSVs
+    SKIP_STEMS = {"summary", "all_results"}
+    PROTOCOL_STEMS = {"test_set", "sn_transfer", "resolution_transfer", "regime_sweep"}
+
     agg_rows = []
     for csv_path in glob.glob("runs/eval/**/*.csv", recursive=True):
         p = Path(csv_path)
+        if p.stem in SKIP_STEMS or p.stem not in PROTOCOL_STEMS:
+            continue
         run_id  = p.parent.name          # e.g. c5g7_ap_micromacro
         protocol = p.stem                 # e.g. sn_transfer
         # Parse run_id → benchmark and model
@@ -190,13 +226,14 @@ def step_aggregate():
 
 
 def _print_summary(rows: list[dict]):
-    """Print a compact table: benchmark × model × protocol → I_rel_l2."""
-    print("\n" + "=" * 80)
-    print("RESULTS SUMMARY  (I_rel_l2, lower is better)")
-    print("=" * 80)
-
-    # Group by benchmark → model → protocol → mean I_rel_l2
+    """Print a compact table: benchmark × model × protocol → key metrics."""
     from collections import defaultdict
+
+    # ── I_rel_l2 table ────────────────────────────────────────────────────────
+    print("\n" + "=" * 100)
+    print("RESULTS SUMMARY  (I_rel_l2, lower is better)")
+    print("=" * 100)
+
     table: dict = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for r in rows:
         val = r.get("I_rel_l2", "")
@@ -205,8 +242,9 @@ def _print_summary(rows: list[dict]):
         except (ValueError, TypeError):
             pass
 
-    protocols = ["sn_transfer", "resolution_transfer", "regime_sweep"]
-    header = f"{'Benchmark':<22} {'Model':<18} " + "  ".join(f"{p:<22}" for p in protocols)
+    protocols = ["test_set", "sn_transfer", "resolution_transfer", "regime_sweep"]
+    col_w = 22
+    header = f"{'Benchmark':<22} {'Model':<18} " + "  ".join(f"{p:<{col_w}}" for p in protocols)
     print(header)
     print("-" * len(header))
 
@@ -216,17 +254,17 @@ def _print_summary(rows: list[dict]):
             for proto in protocols:
                 vals = table[bm][mdl][proto]
                 if vals:
-                    row_str += f"{sum(vals)/len(vals):<22.4f}  "
+                    row_str += f"{sum(vals)/len(vals):<{col_w}.4f}  "
                 else:
-                    row_str += f"{'N/A':<22}  "
+                    row_str += f"{'N/A':<{col_w}}  "
             print(row_str)
         print()
 
-    print("=" * 80)
+    print("=" * 100)
     print("Full results: runs/aggregate/all_results.csv")
     print("Per-run CSVs: runs/eval/<benchmark>_<model>/*.csv")
     print("Checkpoints:  runs/<benchmark>_<model>/checkpoints/best.pt")
-    print("=" * 80 + "\n")
+    print("=" * 100 + "\n")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -254,11 +292,32 @@ def parse_args():
                    help="Skip dataset generation (use existing runs/datasets/)")
     p.add_argument("--skip_train", action="store_true",
                    help="Skip training (use existing checkpoints)")
+    # OpenMC settings — particle count matches publication; batches reduced for speed
+    p.add_argument("--n_particles", type=int, default=100_000,
+                   help="MC particles per batch (default 100 000, same as publication).")
+    p.add_argument("--n_batches", type=int, default=100,
+                   help="Total batches: 50 inactive + 50 active (default 100). "
+                        "Use 300 for full publication quality (50 inactive + 250 active).")
+    p.add_argument("--n_inactive", type=int, default=50,
+                   help="Inactive batches for fission source convergence (default 50, "
+                        "same as OECD/NEA C5G7 reference — do not reduce).")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # ── environment summary ──
+    from src.utils.logging_utils import log_environment_info as _lei
+    benchmarks_to_run = args.benchmark or BENCHMARKS
+    models_to_run     = args.model     or MODELS
+    # Log once for the first benchmark/model to show GPU; per-benchmark logs
+    # below will also show data source.
+    _lei(
+        benchmark_name=benchmarks_to_run[0],
+        model_name=", ".join(models_to_run),
+        data_dir="runs/datasets",
+    )
 
     # ── resolve config ──
     if args.quick:
@@ -294,7 +353,12 @@ def main():
 
         # ── Step 1: generate ──
         if not args.skip_generate:
-            ok = step_generate(bm, n_train, n_val, n_test)
+            ok = step_generate(
+                bm, n_train, n_val, n_test,
+                n_particles=args.n_particles,
+                n_batches=args.n_batches,
+                n_inactive=args.n_inactive,
+            )
             if not ok:
                 log.error(f"  Dataset generation failed for {bm}; skipping benchmark.")
                 failed.append(f"generate:{bm}")
@@ -324,6 +388,11 @@ def main():
             extra = BENCH_EVAL_ARGS.get(bm, [])
 
             # ── Step 3: evaluate ──
+            # Test set baseline (all benchmarks) — run first so it's always available
+            ok = step_eval(bm, mdl, ckpt, "test_set", n_test, batch, extra)
+            if not ok:
+                failed.append(f"eval:test_set:{bm}:{mdl}")
+
             # SN transfer (all benchmarks)
             ok = step_eval(bm, mdl, ckpt, "sn_transfer", n_test, batch, extra)
             if not ok:
@@ -357,10 +426,11 @@ def main():
         log.info("All steps completed successfully.")
 
     log.info("\nKey output files:")
-    log.info("  runs/aggregate/all_results.csv  ← paper table")
-    log.info("  runs/eval/*/sn_transfer.csv      ← discretization transfer")
-    log.info("  runs/eval/*/resolution_transfer.csv")
-    log.info("  runs/eval/*/regime_sweep.csv     ← AP vs FNO vs DeepONet across epsilon")
+    log.info("  runs/aggregate/all_results.csv       ← paper table")
+    log.info("  runs/eval/*/test_set.csv             ← held-out test performance")
+    log.info("  runs/eval/*/sn_transfer.csv          ← angular discretization transfer")
+    log.info("  runs/eval/*/resolution_transfer.csv  ← spatial resolution transfer")
+    log.info("  runs/eval/*/regime_sweep.csv         ← epsilon sweep (pinte2009 only)")
 
 
 if __name__ == "__main__":

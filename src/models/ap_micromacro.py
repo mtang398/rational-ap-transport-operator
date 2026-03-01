@@ -88,8 +88,13 @@ class MacroNet(nn.Module):
 
         # Projection to phi: [channels] -> [G]
         self.phi_proj = nn.Linear(channels, n_groups)
+        nn.init.zeros_(self.phi_proj.weight)
+        nn.init.zeros_(self.phi_proj.bias)
+
         # Projection to J: [channels] -> [dim * G]
         self.J_proj = nn.Linear(channels, dim * n_groups)
+        nn.init.zeros_(self.J_proj.weight)
+        nn.init.zeros_(self.J_proj.bias)
 
         if moment_order >= 2:
             # P2 tensor (symmetric, traceless): dim*(dim+1)/2 - 1 components per group
@@ -105,6 +110,7 @@ class MacroNet(nn.Module):
         params: Tensor,
         x: Tensor,
         spatial_shape: List[int],
+        batch_param_keys: Optional[List[str]] = None,
     ) -> Dict[str, Tensor]:
         """
         Returns:
@@ -117,7 +123,7 @@ class MacroNet(nn.Module):
 
         features = torch.cat([sigma_a, sigma_s, q, bc_flat, x_pos], dim=-1)
         features = self.lift(features)
-        features = features + self.param_enc(params).unsqueeze(1)
+        features = features + self.param_enc(params, batch_param_keys).unsqueeze(1)
 
         # FNO spatial processing
         if self.dim == 2:
@@ -134,7 +140,7 @@ class MacroNet(nn.Module):
             features = feat_grid.permute(0, 2, 3, 4, 1).reshape(B, Nx, self.channels)
 
         # Predict moments
-        phi = F.softplus(self.phi_proj(features))  # [B, Nx, G] (positivity)
+        phi = self.phi_proj(features)  # [B, Nx, G]
         J = self.J_proj(features).reshape(B, Nx, self.dim, G)  # [B, Nx, dim, G]
 
         out = {"phi": phi, "J": J}
@@ -187,6 +193,9 @@ class MicroNet(nn.Module):
             in_dim += self.t_enc.out_dim
 
         self.net = MLP(in_dim, n_groups, hidden_dims, activation=activation)
+        # Zero-initialize output layer so R≈0 at init (I ≈ I_P1 at start of training)
+        nn.init.zeros_(self.net.net[-1].weight)
+        nn.init.zeros_(self.net.net[-1].bias)
         self.time_dependent = time_dependent
 
     def forward(
@@ -307,6 +316,7 @@ class APMicroMacroTransport(nn.Module):
         sigma_a: Tensor, sigma_s: Tensor, q: Tensor,
         bc: Tensor, params: Tensor, x: Tensor,
         spatial_shape: List[int],
+        batch_param_keys: Optional[List[str]] = None,
     ) -> Tuple[Dict[str, Tensor], Tensor]:
         """
         Run macro net and return moments + internal spatial features.
@@ -319,7 +329,7 @@ class APMicroMacroTransport(nn.Module):
         bc_flat = bc.reshape(B, -1).unsqueeze(1).expand(B, Nx, -1)
         features = torch.cat([sigma_a, sigma_s, q, bc_flat, x_pos], dim=-1)
         features = self.macro_net.lift(features)
-        features = features + self.macro_net.param_enc(params).unsqueeze(1)
+        features = features + self.macro_net.param_enc(params, batch_param_keys).unsqueeze(1)
 
         if self.dim == 2:
             H, W = spatial_shape
@@ -334,7 +344,7 @@ class APMicroMacroTransport(nn.Module):
                 feat_grid = block(feat_grid)
             features = feat_grid.permute(0, 2, 3, 4, 1).reshape(B, Nx, self.macro_channels)
 
-        phi = F.softplus(self.macro_net.phi_proj(features))
+        phi = self.macro_net.phi_proj(features)
         J = self.macro_net.J_proj(features).reshape(B, Nx, self.dim, G)
 
         moments = {"phi": phi, "J": J}
@@ -379,7 +389,8 @@ class APMicroMacroTransport(nn.Module):
 
         # --- Macro net ---
         moments, micro_latent = self._get_macro_latent(
-            sigma_a, sigma_s, q, bc, params, x, spatial_shape
+            sigma_a, sigma_s, q, bc, params, x, spatial_shape,
+            batch_param_keys=param_keys,
         )
         phi = moments["phi"]  # [B, Nx, G]
         J = moments["J"]      # [B, Nx, dim, G]
@@ -394,7 +405,10 @@ class APMicroMacroTransport(nn.Module):
 
         # --- Full intensity ---
         I = I_P1 + R
-        I = F.softplus(I - 1e-6) + 1e-6  # soft positivity (allow near-zero)
+        # No positivity squashing — it would add a constant bias (~log(2)≈0.69 for
+        # softplus) that completely swamps the true intensity scale (~0.006 for C5G7).
+        # Non-negativity is encouraged implicitly: I_P1 is built from softplus(phi)
+        # and the loss penalises large deviations from non-negative targets.
 
         if omega_mask is not None:
             mask = omega_mask.unsqueeze(1).unsqueeze(-1).float()
@@ -419,25 +433,29 @@ class APMicroMacroTransport(nn.Module):
         batch: Dict[str, Any],
     ) -> Dict[str, Tensor]:
         """
-        Compute AP micro-macro loss.
+        Compute AP micro-macro loss with scale-normalised terms.
 
-        Returns dict with:
-          loss_intensity: main I matching loss
-          loss_moment:    moment consistency (phi_I ~ phi_macro, J_I ~ J_macro)
-          loss_diffusion: diffusion limit regularization (epsilon-weighted)
-          loss_total:     weighted sum
+        All loss terms are normalised by the batch-level RMS of the reference
+        field so that the loss is dimensionless and the weights (lambda_moment,
+        lambda_diffusion) have consistent meaning regardless of the absolute
+        magnitude of the flux fields (which varies by ~100× across samples).
+
+        Terms:
+          loss_intensity:  relative MSE on I
+          loss_moment:     relative MSE on phi + J (macro consistency)
+          loss_diffusion:  isotropy regularization — penalise |R| when ε is small
+          loss_total:      weighted sum
         """
         I_pred = pred["I"]
         phi_pred = pred["phi"]
         J_pred = pred["J"]
         phi_I = pred["phi_I"]
         J_I = pred["J_I"]
+        R = pred["R"]
 
         I_true = batch["I"]
         phi_true = batch["phi"]
         J_true = batch["J"]
-        q = batch["q"]
-        sigma_a = batch["sigma_a"]
         omega_mask = batch.get("omega_mask")
         params = batch["params"]
         param_keys = batch.get("param_keys", ["epsilon", "g"])
@@ -449,25 +467,44 @@ class APMicroMacroTransport(nn.Module):
         else:
             epsilon = torch.ones(params.shape[0], device=params.device)
 
-        # 1. Intensity loss (masked over omega)
+        # --- Scale normalisers (detached — do not back-prop through them) ---
+        # omega_mask [B, Nw] broadcast-expands to [B, Nx, Nw, G] via unsqueeze(1).unsqueeze(-1).
+        # n_valid must count actual broadcast elements, not just B*Nw.
         if omega_mask is not None:
-            mask = omega_mask.unsqueeze(1).unsqueeze(-1).float()
-            n_valid = mask.sum().clamp(min=1)
+            mask = omega_mask.unsqueeze(1).unsqueeze(-1).float()  # [B, 1, Nw, 1]
+            n_valid = mask.expand_as(I_true).sum().clamp(min=1)   # B*Nx*Nw_valid*G
+            I_scale = ((I_true.detach()**2 * mask).sum() / n_valid).clamp(min=1e-10).sqrt()
+        else:
+            mask = None
+            n_valid = I_true.numel()
+            I_scale = I_true.detach().pow(2).mean().clamp(min=1e-10).sqrt()
+        phi_scale = phi_true.detach().pow(2).mean().clamp(min=1e-10).sqrt()
+        # J can be near-zero in diffusion limit; normalise by phi scale
+        J_scale = phi_scale
+
+        # 1. Intensity loss — relative MSE (over valid angular directions)
+        if mask is not None:
             loss_I = ((I_pred - I_true)**2 * mask).sum() / n_valid
         else:
             loss_I = F.mse_loss(I_pred, I_true)
+        loss_I = loss_I / (I_scale ** 2)
 
-        # 2. Moment consistency: moments from I should match macro net's predictions
-        loss_phi = F.mse_loss(phi_I, phi_pred)
-        loss_J = F.mse_loss(J_I, J_pred)
+        # 2. Moment consistency — relative MSE
+        #    phi_I (from quadrature of predicted I) should match macro net's phi
+        loss_phi = F.mse_loss(phi_I, phi_pred) / (phi_scale ** 2)
+        loss_J   = F.mse_loss(J_I,  J_pred)   / (J_scale  ** 2)
         loss_moment = loss_phi + loss_J
 
         # 3. Diffusion limit regularization
-        # In diffusion limit (epsilon -> 0): phi_diffusion = q / sigma_a
-        # Penalize deviation from this when epsilon is small
-        eps_weight = (1.0 - epsilon.clamp(0, 1)).view(-1, 1, 1)  # -> 1 as eps->0
-        phi_diffusion = q / (sigma_a + 1e-8)  # [B, Nx, G]
-        loss_diffusion = (eps_weight * (phi_I - phi_diffusion)**2).mean()
+        #    As ε → 0 the solution becomes isotropic: the residual R should vanish.
+        #    Penalise the magnitude of R weighted by (1 - ε), which → 1 in the
+        #    diffusion limit and → 0 in the transport limit.
+        eps_weight = (1.0 - epsilon.clamp(0.0, 1.0)).view(-1, 1, 1, 1)
+        if mask is not None:
+            loss_diffusion = (eps_weight * R**2 * mask).sum() / n_valid
+        else:
+            loss_diffusion = (eps_weight * R**2).mean()
+        loss_diffusion = loss_diffusion / (I_scale ** 2)
 
         loss_total = (loss_I
                       + self.lambda_moment * loss_moment

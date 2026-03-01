@@ -124,6 +124,17 @@ def main():
 
     set_seed(args.seed)
 
+    from src.utils.logging_utils import log_environment_info
+    log_environment_info(
+        benchmark_name="c5g7",
+        model_name=None,
+        data_dir=args.output_dir,
+        source_override=(
+            "REAL solver output  [OpenMC Monte Carlo — multigroup eigenvalue]  "
+            f"← will write to {args.output_dir}"
+        ),
+    )
+
     import numpy as np
     from src.solvers.openmc_interface import OpenMCInterface
     from src.solvers.openmc_c5g7_model import C5G7OpenMCModel

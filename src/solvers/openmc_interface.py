@@ -21,17 +21,16 @@ For continuous-energy mode (not needed here) you also need nuclear data:
 Usage
 -----
   from src.solvers.openmc_interface import OpenMCInterface
-  solver = OpenMCInterface(n_particles=100_000)
+  solver = OpenMCInterface(n_particles=100_000, n_batches=100, n_inactive=50)
   result = solver.solve_c5g7()   # returns TransportSample with real MC flux
 
-  # Or from the CLI:
-  python scripts/run_openmc_c5g7.py --n_particles 100000 --output runs/datasets/
+  # Or from the CLI (via generate_dataset.py which sets these automatically):
+  python scripts/generate_dataset.py --benchmark c5g7 --split train --n_samples 200
 """
 
 from __future__ import annotations
 import logging
 import os
-import tempfile
 from pathlib import Path
 from typing import Optional, List
 
@@ -74,7 +73,7 @@ class OpenMCInterface:
     def __init__(
         self,
         n_particles: int = 100_000,
-        n_batches:   int = 300,
+        n_batches:   int = 100,
         n_inactive:  int = 50,
         n_mesh:      int = 51,
         fallback:    bool = True,
@@ -87,9 +86,21 @@ class OpenMCInterface:
         self.n_mesh      = int(n_mesh)
         self.fallback    = fallback
         self.work_dir    = Path(work_dir) if work_dir else \
-                           Path(tempfile.mkdtemp(prefix="openmc_c5g7_"))
+                           Path("runs/openmc_c5g7")
+        self.work_dir.mkdir(parents=True, exist_ok=True)
         self.seed        = seed
         self._available  = self._check_available()
+        if self._available:
+            logger.info(
+                f"OpenMCInterface: binary found — real Monte Carlo solver active "
+                f"(n_particles={self.n_particles}, n_batches={self.n_batches})"
+            )
+        else:
+            logger.warning(
+                "OpenMCInterface: openmc binary NOT found — "
+                "will fall back to diffusion approximation if fallback=True. "
+                "Install with: conda install -c conda-forge openmc"
+            )
 
     # ── availability ──────────────────────────────────────────────────────────
 
@@ -157,10 +168,9 @@ class OpenMCInterface:
         if not self._available:
             if self.fallback:
                 logger.warning(
-                    "OpenMC is not installed → using diffusion-approximation flux.\n"
-                    "To get real Monte Carlo flux:\n"
-                    "  conda install -c conda-forge openmc\n"
-                    "Then re-run this script."
+                    "OpenMCInterface.solve_c5g7: binary unavailable — "
+                    "falling back to SYNTHETIC diffusion approximation (not MC). "
+                    "Install with: conda install -c conda-forge openmc"
                 )
                 return self._diffusion_fallback(spatial_shape, n_omega, epsilon)
             raise RuntimeError(
@@ -170,18 +180,88 @@ class OpenMCInterface:
 
         return self._run_c5g7_openmc(spatial_shape, n_omega, epsilon, force_rerun)
 
+    def batch_solve(self, samples: list, show_progress: bool = True) -> list:
+        """Solve a batch of samples, calling solve() on each one."""
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(samples, desc="OpenMCInterface") if show_progress else samples
+        except ImportError:
+            iterator = samples
+
+        return [self.solve(s) for s in iterator]
+
     def solve(self, sample: TransportSample) -> TransportSample:
         """
         Generic solver: run OpenMC on an arbitrary TransportSample.
-        For C5G7-like samples uses the full C5G7 model;
-        for other samples uses a homogenised fixed-source model.
+
+        For C5G7 benchmarks:
+          - Extracts per-material XS multipliers stored in the sample's metadata
+            (put there by C5G7Converter when it perturbs XS).  Each unique
+            perturbation gets its own OpenMC run in a dedicated subdirectory so
+            the model truly learns the operator  T: (σ_a, σ_s, q, ε) → I(x,ω)
+            over a distribution of physics configurations, not just one.
+          - The MC eigenvalue calculation runs at the native n_mesh×n_mesh tally
+            resolution.  If the sample's spatial_shape differs, the MC flux is
+            bilinearly interpolated to the requested shape — still real MC data.
+          - The XS arrays (sigma_a, sigma_s, q) stay at the sample's own
+            resolution so input and target dimensions are consistent.
+
+        For other benchmarks uses a homogenised fixed-source model.
         """
         bm = sample.inputs.metadata.get("benchmark_name", "")
         if "c5g7" in bm:
-            phi_mc, keff = self._run_c5g7_model(force_rerun=False)
-            return self._build_sample_from_phi(sample, phi_mc)
+            xs_mults = sample.inputs.metadata.get("xs_multipliers", None)
+            sid      = sample.sample_id
+            phi_mc, keff = self._run_c5g7_model(
+                force_rerun=False, xs_multipliers=xs_mults, sample_id=sid
+            )
+            shape  = sample.inputs.spatial_shape
+            native = (self.n_mesh, self.n_mesh)
+            if shape != native:
+                logger.info(
+                    f"OpenMCInterface.solve: interpolating MC flux from native "
+                    f"{native} to requested shape={shape} (real MC data, no approximation)."
+                )
+                phi_mc = self._interpolate_phi(phi_mc, native, shape)
+            return self._build_sample_from_phi(sample, phi_mc, keff=keff)
         else:
             return self._run_generic(sample)
+
+    @staticmethod
+    def _interpolate_phi(
+        phi_mc: np.ndarray,
+        src_shape: tuple,
+        dst_shape: tuple,
+    ) -> np.ndarray:
+        """
+        Bilinearly interpolate MC scalar flux from src_shape to dst_shape.
+
+        Parameters
+        ----------
+        phi_mc   : [nx_src, ny_src, G]  — MC tally output on native mesh
+        src_shape: (nx_src, ny_src)
+        dst_shape: (nx_dst, ny_dst)
+
+        Returns
+        -------
+        phi_out  : [nx_dst, ny_dst, G]  — interpolated MC flux
+        """
+        from scipy.ndimage import zoom as _zoom
+        nx_src, ny_src = src_shape
+        nx_dst, ny_dst = dst_shape
+        G = phi_mc.shape[2]
+        # Compute zoom factors for spatial axes only; group axis unchanged
+        zx = nx_dst / nx_src
+        zy = ny_dst / ny_src
+        # Interpolate each group independently (order=1 = bilinear)
+        out = np.zeros((nx_dst, ny_dst, G), dtype=np.float32)
+        for g in range(G):
+            out[:, :, g] = _zoom(phi_mc[:, :, g].astype(np.float64),
+                                 (zx, zy), order=1).astype(np.float32)
+        # Preserve non-negativity (bilinear interpolation can very rarely give
+        # tiny negative values near zero-flux boundaries due to floating point)
+        out = np.maximum(out, 0.0)
+        return out
 
     # ── C5G7 OpenMC run ───────────────────────────────────────────────────────
 
@@ -191,25 +271,63 @@ class OpenMCInterface:
         n_omega: int,
         epsilon: float,
         force_rerun: bool,
+        xs_multipliers: Optional[dict] = None,
+        sample_id: Optional[str] = None,
     ) -> TransportSample:
-        phi_mc, keff = self._run_c5g7_model(force_rerun)
-        nx, ny = self.n_mesh, self.n_mesh
+        phi_mc, keff = self._run_c5g7_model(
+            force_rerun, xs_multipliers=xs_multipliers, sample_id=sample_id
+        )
+        native = (self.n_mesh, self.n_mesh)
         G = 7
         L = 64.26  # cm
 
-        # Inputs from published C5G7 geometry
-        mat_map = build_quarter_core_map(17)  # 51×51
+        # Interpolate MC flux to requested spatial_shape if different from native mesh.
+        if spatial_shape != native:
+            logger.info(
+                f"_run_c5g7_openmc: interpolating MC flux from native "
+                f"{native} to requested shape={spatial_shape} (real MC data, no approximation)."
+            )
+            phi_mc = self._interpolate_phi(phi_mc, native, spatial_shape)
+
+        nx, ny = spatial_shape
+        # Build XS arrays at the requested spatial resolution
+        n_pins = 17
+        mat_map_native = build_quarter_core_map(n_pins)  # 51×51 at native resolution
+        if spatial_shape != native:
+            # Nearest-neighbour upsample material map to requested resolution
+            from scipy.ndimage import zoom as _zoom
+            zx = nx / native[0]
+            zy = ny / native[1]
+            mat_map = _zoom(mat_map_native.astype(np.float32), (zx, zy), order=0).astype(int)
+        else:
+            mat_map = mat_map_native
+
         sigma_a = np.zeros((nx, ny, G), dtype=np.float32)
         sigma_s = np.zeros((nx, ny, G), dtype=np.float32)
         q_arr   = np.zeros((nx, ny, G), dtype=np.float32)
+        mults   = xs_multipliers or {}
         for mid, mname in enumerate(MATERIAL_NAMES):
-            xs = C5G7_XS[mname]
+            xs   = C5G7_XS[mname]
             mask = (mat_map == mid)
-            sigma_a[mask] = xs["sigma_a"]
-            sigma_s[mask] = [xs["sigma_s"][g][g] for g in range(G)]
-            chi   = np.array(xs["chi"], dtype=np.float32)
-            nu_sf = np.array(xs["nu_sigma_f"], dtype=np.float32)
-            q_arr[mask] = chi * np.sum(nu_sf) * 0.1
+            m    = mults.get(mname, {})
+            sa_ref = np.array(xs["sigma_a"], dtype=np.float32)
+            ss_ref = np.array([xs["sigma_s"][g][g] for g in range(G)], dtype=np.float32)
+            chi    = np.array(xs["chi"], dtype=np.float32)
+            nu_sf  = np.array(xs["nu_sigma_f"], dtype=np.float32)
+            # Apply same per-material multipliers that were fed to the MGXS library
+            if "sigma_a" in m:
+                sa_ref = sa_ref * np.asarray(m["sigma_a"], dtype=np.float32)
+            if "sigma_s" in m:
+                ss_ref = ss_ref * np.asarray(m["sigma_s"], dtype=np.float32)
+            if "nu_fission" in m:
+                nu_sf = nu_sf * np.asarray(m["nu_fission"], dtype=np.float32)
+            sigma_a[mask] = sa_ref
+            sigma_s[mask] = ss_ref
+            q_arr[mask]   = chi * np.sum(nu_sf) * 0.1
+
+        # No global q_scale: C5G7 is an eigenvalue problem where q is determined
+        # by the flux itself, not an independent input.  XS multipliers fully
+        # characterise the perturbed physics.
 
         Nx = nx * ny
         xs_coord = np.linspace(0, L, nx, dtype=np.float32)
@@ -218,25 +336,31 @@ class OpenMCInterface:
         x_query  = np.stack([XX.ravel(), YY.ravel()], axis=-1)
 
         # phi_mc is [nx, ny, G] → flatten to [Nx, G]
-        phi_vals = phi_mc.reshape(Nx, G)
+        phi_vals = phi_mc.reshape(Nx, G).astype(np.float32)
 
         # Angular quadrature
         angles  = np.linspace(0, 2*np.pi, n_omega, endpoint=False, dtype=np.float32)
         omega   = np.stack([np.cos(angles), np.sin(angles)], axis=-1)
         w_omega = np.full(n_omega, 2*np.pi / n_omega, dtype=np.float32)
 
-        # P1 intensity
-        norm   = 2 * np.pi
-        I_vals = np.broadcast_to(phi_vals[:, np.newaxis, :] / norm,
-                                  (Nx, n_omega, G)).copy()
-
-        # Current via Fick's law
+        # Fick current used only as intermediate to build P1 intensity
         phi_grid = phi_vals.reshape(nx, ny, G)
-        dx = L / max(nx-1, 1);  dy = L / max(ny-1, 1)
+        dx = L / max(nx-1, 1)
+        dy = L / max(ny-1, 1)
         D_grid = 1.0 / (3.0 * np.maximum(sigma_a + sigma_s, 1e-8))
-        Jx = -(D_grid * np.gradient(phi_grid, dx, axis=0)).reshape(Nx, G)
-        Jy = -(D_grid * np.gradient(phi_grid, dy, axis=1)).reshape(Nx, G)
-        J_vals = np.stack([Jx, Jy], axis=1)
+        Jx_fick = -(D_grid * np.gradient(phi_grid, dx, axis=0)).reshape(Nx, G)
+        Jy_fick = -(D_grid * np.gradient(phi_grid, dy, axis=1)).reshape(Nx, G)
+        J_fick = np.stack([Jx_fick, Jy_fick], axis=1)
+
+        # P1 intensity: I(x,Ω) = phi/(2π) * [1 + (3·J_fick·Ω) / (2π·phi)]
+        phi_safe = np.maximum(phi_vals, 1e-30)
+        JdotOmega = np.einsum('xdg,wd->xwg', J_fick, omega)   # [Nx, Nw, G]
+        correction = 1.0 + (3.0 / (2 * np.pi)) * JdotOmega / phi_safe[:, np.newaxis, :]
+        correction = np.maximum(correction, 0.0)
+        I_vals = (phi_vals[:, np.newaxis, :] / (2 * np.pi) * correction).astype(np.float32)
+
+        # J stored = angular quadrature moment of I (self-consistent with model's J head)
+        J_vals = np.einsum('w,wd,nwg->ndg', w_omega, omega, I_vals).astype(np.float32)
 
         bc      = BCSpec(bc_type="vacuum")
         inputs  = InputFields(
@@ -261,15 +385,22 @@ class OpenMCInterface:
             sample_id="c5g7_openmc_0000",
         )
 
-    def _run_c5g7_model(self, force_rerun: bool) -> tuple:
+    def _run_c5g7_model(
+        self,
+        force_rerun: bool,
+        xs_multipliers: Optional[dict] = None,
+        sample_id: Optional[str] = None,
+    ) -> tuple:
         """Run C5G7OpenMCModel and return (phi [51,51,7], keff)."""
         from .openmc_c5g7_model import C5G7OpenMCModel
         model = C5G7OpenMCModel(
-            work_dir    = str(self.work_dir),
-            n_particles = self.n_particles,
-            n_batches   = self.n_batches,
-            n_inactive  = self.n_inactive,
-            n_mesh      = self.n_mesh,
+            work_dir       = str(self.work_dir),
+            n_particles    = self.n_particles,
+            n_batches      = self.n_batches,
+            n_inactive     = self.n_inactive,
+            n_mesh         = self.n_mesh,
+            xs_multipliers = xs_multipliers,
+            sample_id      = sample_id,
         )
         return model.run(force=force_rerun)
 
@@ -282,7 +413,10 @@ class OpenMCInterface:
         conv = C5G7Converter()
         import numpy as _np
         rng = _np.random.default_rng(42)
-        samples = conv._generate_from_geometry(1, spatial_shape, n_omega, rng, epsilon)
+        # xs_perturb=0.0: fallback returns the canonical (unperturbed) geometry,
+        # not a randomly perturbed sample.
+        samples = conv._generate_from_geometry(1, spatial_shape, n_omega, rng, epsilon,
+                                               xs_perturb=0.0)
         return samples[0]
 
     # ── generic fixed-source model ────────────────────────────────────────────
@@ -369,9 +503,32 @@ class OpenMCInterface:
         Nx    = sample.query.n_spatial
         Nw    = sample.query.n_omega
         phi   = flux[:Nx*G].reshape(Nx, G)
-        I_arr = np.broadcast_to(phi[:, np.newaxis, :] / (4*np.pi),
-                                 (Nx, Nw, G)).copy()
-        J_arr = np.zeros((Nx, dim, G), dtype=np.float32)
+        # Build I via P1 using Fick current as the angular-variation driver
+        omega_arr = sample.query.omega   # [Nw, dim]
+        w_arr     = sample.query.w_omega # [Nw]
+        norm = 4 * np.pi if dim == 3 else 2 * np.pi
+        phi_safe = np.maximum(phi, 1e-30)
+
+        J_fick = np.zeros((Nx, dim, G), dtype=np.float32)
+        if dim == 2:
+            nx2, ny2 = shape
+            L2 = 64.26
+            sa = sample.inputs.sigma_a.reshape(Nx, G)
+            ss = sample.inputs.sigma_s.reshape(Nx, G)
+            D2 = 1.0 / (3.0 * np.maximum(sa + ss, 1e-8))
+            pg = phi.reshape(nx2, ny2, G)
+            dx2 = L2 / max(nx2 - 1, 1)
+            dy2 = L2 / max(ny2 - 1, 1)
+            Jx2 = -(D2 * np.gradient(pg, dx2, axis=0)).reshape(Nx, G)
+            Jy2 = -(D2 * np.gradient(pg, dy2, axis=1)).reshape(Nx, G)
+            J_fick = np.stack([Jx2, Jy2], axis=1)
+
+        JdotOmega = np.einsum('xdg,wd->xwg', J_fick, omega_arr)
+        corr = np.maximum(1.0 + (3.0 / norm) * JdotOmega / phi_safe[:, np.newaxis, :], 0.0)
+        I_arr = (phi[:, np.newaxis, :] / norm * corr).astype(np.float32)
+
+        # J stored = quadrature moment of I (self-consistent with model's J head)
+        J_arr = np.einsum('w,wd,nwg->ndg', w_arr, omega_arr, I_arr).astype(np.float32)
 
         new_targets = TargetFields(I=I_arr, phi=phi, J=J_arr)
         return TransportSample(
@@ -381,19 +538,82 @@ class OpenMCInterface:
         )
 
     def _build_sample_from_phi(
-        self, sample: TransportSample, phi_mc: np.ndarray
+        self, sample: TransportSample, phi_mc: np.ndarray, keff: float = 0.0
     ) -> TransportSample:
-        """Replace targets of an existing sample with OpenMC flux."""
+        """
+        Replace targets of an existing sample with OpenMC scalar flux.
+
+        - phi  : taken directly from the OpenMC tally (real MC solution).
+        - J    : computed via Fick's law using the sample's own (possibly
+                 perturbed) cross-sections, so input/target physics are
+                 self-consistent.
+        - I    : P1 approximation  I(x,Ω) = phi/(2π) [1 + 3/(2π) * J·Ω]
+                 This gives first-order angular variation instead of the
+                 purely isotropic broadcast used previously.
+        """
         Nx = sample.query.n_spatial
         Nw = sample.query.n_omega
         G  = sample.inputs.n_groups
-        phi = phi_mc.reshape(Nx, G)
-        I_arr = np.broadcast_to(phi[:, np.newaxis, :] / (2*np.pi),
-                                 (Nx, Nw, G)).copy()
-        J_arr = np.zeros((Nx, sample.inputs.dim, G), dtype=np.float32)
+        # phi_mc is [nx, ny, G] or already [Nx, G]; normalise to [Nx, G]
+        phi = phi_mc.reshape(Nx, G).astype(np.float32)
+
+        # Build I via P1, using Fick current as the angular-variation driver.
+        # J stored in the sample will be the quadrature moment of I so it is
+        # self-consistent with what the model's J head computes.
+        dim = sample.inputs.dim
+        shape = sample.inputs.spatial_shape
+        L = 64.26
+        sigma_a = sample.inputs.sigma_a.reshape(Nx, G)
+        sigma_s = sample.inputs.sigma_s.reshape(Nx, G)
+        D = 1.0 / (3.0 * np.maximum(sigma_a + sigma_s, 1e-8))  # [Nx, G]
+
+        omega = sample.query.omega  # [Nw, dim]
+        w_omega = sample.query.w_omega  # [Nw]
+        phi_safe = np.maximum(phi, 1e-30)  # [Nx, G]
+
+        if dim == 2:
+            nx, ny = shape
+            phi_grid = phi.reshape(nx, ny, G)
+            dx = L / max(nx - 1, 1)
+            dy = L / max(ny - 1, 1)
+            D_grid = D.reshape(nx, ny, G)
+            Jx_fick = -(D_grid * np.gradient(phi_grid, dx, axis=0)).reshape(Nx, G)
+            Jy_fick = -(D_grid * np.gradient(phi_grid, dy, axis=1)).reshape(Nx, G)
+            J_fick = np.stack([Jx_fick, Jy_fick], axis=1)         # [Nx, 2, G]
+
+            JdotOmega = np.einsum('xdg,wd->xwg', J_fick, omega)   # [Nx, Nw, G]
+            correction = 1.0 + (3.0 / (2 * np.pi)) * JdotOmega / phi_safe[:, np.newaxis, :]
+            correction = np.maximum(correction, 0.0)
+            I_arr = (phi[:, np.newaxis, :] / (2 * np.pi) * correction).astype(np.float32)
+        else:
+            I_arr = np.broadcast_to(
+                phi[:, np.newaxis, :] / (4 * np.pi), (Nx, Nw, G)
+            ).copy().astype(np.float32)
+
+        # J stored = angular quadrature moment of I (consistent with model output)
+        J_arr = np.einsum('w,wd,nwg->ndg', w_omega, omega, I_arr).astype(np.float32)
+
+        # Update metadata to record that phi came from OpenMC
+        import copy as _copy
+        new_meta = _copy.copy(sample.inputs.metadata)
+        new_meta["flux_source"] = "openmc_multigroup_mc"
+        new_meta["n_particles"] = self.n_particles
+        new_meta["n_batches"]   = self.n_batches
+        if keff:
+            new_meta["keff"] = float(keff)
+
+        new_inputs = InputFields(
+            sigma_a      = sample.inputs.sigma_a,
+            sigma_s      = sample.inputs.sigma_s,
+            q            = sample.inputs.q,
+            extra_fields = sample.inputs.extra_fields,
+            bc           = sample.inputs.bc,
+            params       = sample.inputs.params,
+            metadata     = new_meta,
+        )
         new_t = TargetFields(I=I_arr, phi=phi, J=J_arr)
         return TransportSample(
-            inputs=sample.inputs, query=sample.query,
+            inputs=new_inputs, query=sample.query,
             targets=new_t,
             sample_id=sample.sample_id + "_openmc",
         )

@@ -17,7 +17,7 @@ class BenchmarkConfig:
     n_samples_val: int = 50
     n_samples_test: int = 50
     epsilon_range: List[float] = field(default_factory=lambda: [0.01, 1.0])
-    solver: str = "mock"
+    solver: str = "auto"
     raw_dir: Optional[str] = None
     time_dependent: bool = False
     n_time: int = 10
@@ -97,5 +97,6 @@ class EvalConfig:
     batch_size: int = 4
     n_test_samples: int = 50
     output_dir: str = "runs/eval"
+    solver: str = "auto"
     device: Optional[str] = None
     seed: int = 42

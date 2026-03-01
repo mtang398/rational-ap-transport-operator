@@ -6,6 +6,17 @@ Metrics:
 - Moment errors: phi, J
 - QoI errors (benchmark-specific)
 - Energy balance residual (best-effort, reports N/A if fields missing)
+
+Relative L2 convention
+----------------------
+All relative L2 errors are computed **per sample** and then averaged across
+the batch.  This is the standard convention in operator-learning papers
+(e.g. FNO, DeepONet) and avoids the denominator-collapse problem that occurs
+when fields such as J have near-zero global norm (common in diffusive regimes
+where the net current is small relative to the scalar flux).
+
+Formally, for a batch of B samples:
+    rel_L2 = (1/B) Σ_b ||pred_b - true_b|| / (||true_b|| + ε)
 """
 
 from __future__ import annotations
@@ -45,7 +56,7 @@ class MetricBundle:
 
 
 def l2_error(pred: Tensor, true: Tensor, mask: Optional[Tensor] = None) -> float:
-    """Compute L2 norm of error (root-mean-square)."""
+    """Compute RMS L2 error averaged over all elements (or masked elements)."""
     diff = pred - true
     if mask is not None:
         diff = diff * mask.float()
@@ -56,17 +67,33 @@ def l2_error(pred: Tensor, true: Tensor, mask: Optional[Tensor] = None) -> float
 
 def relative_l2_error(pred: Tensor, true: Tensor, mask: Optional[Tensor] = None,
                       eps: float = 1e-8) -> float:
-    """Compute relative L2 error: ||pred-true||_2 / ||true||_2."""
-    diff = pred - true
+    """
+    Compute per-sample relative L2 error, averaged over the batch.
+
+    For each sample b:
+        r_b = ||pred_b - true_b||_F / (||true_b||_F + eps)
+    Returns mean(r_b) over all B samples in the leading batch dimension.
+
+    This per-sample averaging is robust to near-zero global norms (e.g. J in
+    diffusive regimes) and matches the convention in FNO / DeepONet papers.
+    """
+    B = pred.shape[0]
+    # Flatten everything except the batch dimension
+    pred_flat = pred.reshape(B, -1)
+    true_flat = true.reshape(B, -1)
+
     if mask is not None:
-        diff = diff * mask.float()
-        true_masked = true * mask.float()
-        num = (diff**2).sum().item()
-        denom = (true_masked**2).sum().item()
+        # mask broadcasts: flatten to [B, -1] matching pred_flat
+        mask_flat = mask.reshape(B, -1).float()
+        diff_flat = (pred_flat - true_flat) * mask_flat
+        true_flat = true_flat * mask_flat
     else:
-        num = (diff**2).sum().item()
-        denom = (true**2).sum().item()
-    return math.sqrt(num / (denom + eps))
+        diff_flat = pred_flat - true_flat
+
+    num = (diff_flat ** 2).sum(dim=1)          # [B]
+    denom = (true_flat ** 2).sum(dim=1) + eps  # [B]
+    per_sample = torch.sqrt(num / denom)        # [B]
+    return per_sample.mean().item()
 
 
 def compute_metrics(
@@ -105,9 +132,11 @@ def compute_metrics(
 
     # --- Intensity metrics ---
     if I_pred is not None and I_true is not None:
-        # Expand mask for I: [B, Nx, Nw, G]
+        # Build mask [B, Nx, Nw, G] for l2_error (element-wise masking)
+        # and a broadcastable version for relative_l2_error (reshape-based).
         if omega_mask is not None:
-            I_mask = omega_mask.unsqueeze(1).unsqueeze(-1).expand_as(I_pred)
+            # [B, Nw] -> [B, Nx, Nw, G]  (contiguous, not just a view)
+            I_mask = omega_mask.unsqueeze(1).unsqueeze(-1).expand_as(I_pred).contiguous()
         else:
             I_mask = None
 
@@ -178,7 +207,7 @@ def aggregate_metrics(metric_list: list) -> Dict[str, float]:
     for k in keys:
         vals = [getattr(m, k) for m in metric_list if not math.isnan(getattr(m, k))]
         summary[k] = sum(vals) / len(vals) if vals else float("nan")
-        summary[f"{k}_std"] = float(torch.tensor(vals).std().item()) if len(vals) > 1 else 0.0
+        summary[f"{k}_std"] = float(torch.tensor(vals).std().item()) if len(vals) > 1 else (0.0 if vals else float("nan"))
 
     # QoI aggregation
     all_qoi_keys = set()

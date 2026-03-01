@@ -35,8 +35,8 @@ def test_smoke_train(model_name):
     """Smoke test: 2 epochs of training should not crash."""
     set_seed(42)
 
-    train_ds = MockDataset(n_samples=8, spatial_shape=(8, 8), n_omega=4, n_groups=1, seed=42)
-    val_ds = MockDataset(n_samples=4, spatial_shape=(8, 8), n_omega=4, n_groups=1, seed=123)
+    train_ds = MockDataset(n_samples=8, spatial_shape=(8, 8), n_omega=4, n_groups=1, seed=42, solver_name="mock")
+    val_ds = MockDataset(n_samples=4, spatial_shape=(8, 8), n_omega=4, n_groups=1, seed=123, solver_name="mock")
 
     model = make_tiny_model(model_name, dim=2, n_groups=1)
 
@@ -66,7 +66,7 @@ def test_smoke_train(model_name):
 def test_checkpoint_resume():
     """Test that training can be resumed from a checkpoint."""
     set_seed(0)
-    train_ds = MockDataset(n_samples=8, spatial_shape=(8, 8), n_omega=4, seed=0)
+    train_ds = MockDataset(n_samples=8, spatial_shape=(8, 8), n_omega=4, seed=0, solver_name="mock")
 
     model = make_tiny_model("fno")
 
@@ -110,7 +110,7 @@ def test_checkpoint_resume():
 def test_ema():
     """Test EMA runs without crashing."""
     set_seed(1)
-    train_ds = MockDataset(n_samples=8, spatial_shape=(8, 8), n_omega=4, seed=1)
+    train_ds = MockDataset(n_samples=8, spatial_shape=(8, 8), n_omega=4, seed=1, solver_name="mock")
     model = make_tiny_model("fno")
 
     with tempfile.TemporaryDirectory() as tmpdir:

@@ -49,7 +49,7 @@ class TestL2Metrics:
 
 class TestComputeMetrics:
     def _make_batch_pred(self, n_omega=4, batch_size=2):
-        ds = MockDataset(n_samples=batch_size, spatial_shape=(8, 8), n_omega=n_omega)
+        ds = MockDataset(n_samples=batch_size, spatial_shape=(8, 8), n_omega=n_omega, solver_name="mock")
         loader = DataLoader(ds, batch_size=batch_size, collate_fn=collate_fn)
         batch = next(iter(loader))
         # Perfect prediction (use true values as pred)

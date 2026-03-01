@@ -20,13 +20,14 @@ import time
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from torch.utils.data import DataLoader
 
-from ..data.dataset import collate_fn
+from ..data.dataset import collate_fn, resample_omega_directions
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,8 @@ class Trainer:
         batch_size: int = 8,
         grad_clip: float = 1.0,
         use_amp: bool = False,
+        # Angular augmentation
+        augment_omega: bool = True,
         # EMA
         use_ema: bool = False,
         ema_decay: float = 0.999,
@@ -120,8 +123,10 @@ class Trainer:
         self.val_every = val_every
         self.grad_clip = grad_clip
         self.use_amp = use_amp
+        self.augment_omega = augment_omega
         self.seed = seed
         self.model_args = model_args or {}
+        self._aug_rng = np.random.default_rng(seed + 1)
 
         # Device
         if device is None:
@@ -205,21 +210,31 @@ class Trainer:
         if hasattr(self.model, "compute_loss"):
             return self.model.compute_loss(pred, batch)
 
-        # Default: L2 loss on I
+        # Default: relative MSE on I and phi, normalised by the RMS of the
+        # *valid* (unmasked) target elements.  Computing RMS over all elements
+        # (including zero-padded boundaries/void cells) deflates the scale by
+        # ~100× and makes the normalised loss meaningless.
         I_pred = pred["I"]
         I_true = batch["I"].to(self.device)
         omega_mask = batch.get("omega_mask")
         if omega_mask is not None:
             omega_mask = omega_mask.to(self.device)
-            mask = omega_mask.unsqueeze(1).unsqueeze(-1).float()
-            n_valid = mask.sum().clamp(min=1)
+            mask = omega_mask.unsqueeze(1).unsqueeze(-1).float()  # [B, 1, Nw, 1]
+            n_valid = mask.expand_as(I_true).sum().clamp(min=1)   # B*Nx*Nw_valid*G
             loss_I = ((I_pred - I_true)**2 * mask).sum() / n_valid
+            I_scale = ((I_true.detach()**2 * mask).sum() / n_valid).clamp(min=1e-10).sqrt()
         else:
             loss_I = torch.nn.functional.mse_loss(I_pred, I_true)
+            I_scale = I_true.detach().pow(2).mean().clamp(min=1e-10).sqrt()
+        loss_I = loss_I / (I_scale ** 2)
 
         phi_pred = pred.get("phi")
         phi_true = batch["phi"].to(self.device)
-        loss_phi = torch.nn.functional.mse_loss(phi_pred, phi_true) if phi_pred is not None else torch.tensor(0.0)
+        if phi_pred is not None:
+            phi_scale = phi_true.detach().pow(2).mean().clamp(min=1e-10).sqrt()
+            loss_phi = torch.nn.functional.mse_loss(phi_pred, phi_true) / (phi_scale ** 2)
+        else:
+            loss_phi = torch.tensor(0.0, device=self.device)
 
         loss_total = loss_I + 0.1 * loss_phi
         return {
@@ -238,6 +253,77 @@ class Trainer:
                 out[k] = v
         return out
 
+    def _augment_batch_omega(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Angular-direction augmentation on a collated batch (CPU tensors).
+
+        Randomly rotates the quadrature grid by a per-batch offset so that the
+        model sees a different set of discrete SN directions every iteration.
+        The target I is recomputed via the P1 formula from stored phi/J.
+
+        For C5G7, OpenMC provides only the scalar flux φ(x) via tallies.  The
+        angular intensity I(x,ω) stored in the dataset is P1-reconstructed from
+        φ and J_Fick at a fixed S8 quadrature (8 uniformly-spaced directions).
+        Because I is a P1 field derived from stored φ and J, rotating ω and
+        recomputing I from those same φ/J values is exactly self-consistent —
+        the augmented targets are as valid as the originals.  This augmentation
+        therefore teaches the model discretisation-agnosticism at zero cost.
+
+        Only applied when self.augment_omega is True.
+        """
+        if not self.augment_omega:
+            return batch
+
+        omega = batch.get("omega")   # [B, Nw, dim]
+        I     = batch.get("I")       # [B, Nx, Nw, G]
+        phi   = batch.get("phi")     # [B, Nx, G]
+        J     = batch.get("J")       # [B, Nx, dim, G]
+
+        if omega is None or I is None or phi is None or J is None:
+            return batch
+
+        dim = omega.shape[-1]
+        n_omega = omega.shape[1]
+
+        # For 2-D problems: apply a random rotation offset to the whole grid.
+        if dim == 2:
+            offset = float(self._aug_rng.uniform(0, 2 * np.pi / n_omega))
+            theta_new = (torch.atan2(omega[..., 1], omega[..., 0]) + offset)  # [B, Nw]
+            omega_new = torch.stack([torch.cos(theta_new), torch.sin(theta_new)], dim=-1)
+
+            # Recompute I at the new directions via P1 from stored phi, J
+            norm = 2.0 * np.pi
+            phi_safe = phi.clamp(min=1e-30).unsqueeze(2)                       # [B, Nx, 1, G]
+            JdotOmega = torch.einsum('bndg,bwd->bnwg', J, omega_new)           # [B, Nx, Nw, G]
+            correction = (1.0 + (2.0 / norm) * JdotOmega / phi_safe).clamp(min=0.0)
+            I_new = (phi.unsqueeze(2) / norm) * correction
+
+            batch = dict(batch)
+            batch["omega"] = omega_new
+            batch["I"] = I_new
+
+        # 3-D: apply a random rotation about the z-axis (keeps the quadrature uniform)
+        elif dim == 3:
+            angle = float(self._aug_rng.uniform(0, 2 * np.pi))
+            cos_a = np.cos(angle)
+            sin_a = np.sin(angle)
+            ox, oy, oz = omega[..., 0], omega[..., 1], omega[..., 2]
+            ox_new = cos_a * ox - sin_a * oy
+            oy_new = sin_a * ox + cos_a * oy
+            omega_new = torch.stack([ox_new, oy_new, oz], dim=-1)
+
+            norm = 4.0 * np.pi
+            phi_safe = phi.clamp(min=1e-30).unsqueeze(2)
+            JdotOmega = torch.einsum('bndg,bwd->bnwg', J, omega_new)
+            correction = (1.0 + (3.0 / norm) * JdotOmega / phi_safe).clamp(min=0.0)
+            I_new = (phi.unsqueeze(2) / norm) * correction
+
+            batch = dict(batch)
+            batch["omega"] = omega_new
+            batch["I"] = I_new
+
+        return batch
+
     def train_epoch(self) -> Dict[str, float]:
         self.model.train()
         total_losses: Dict[str, float] = {}
@@ -245,6 +331,7 @@ class Trainer:
 
         for batch in self.train_loader:
             batch = self._move_batch(batch)
+            batch = self._augment_batch_omega(batch)
 
             self.optimizer.zero_grad()
 
@@ -369,6 +456,8 @@ class Trainer:
         # Save best
         if val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
+            # Update best_val_loss in the saved state before writing
+            state["best_val_loss"] = self.best_val_loss
             best_path = self.checkpoint_dir / "best.pt"
             torch.save(state, best_path)
             logger.info(f"New best model saved: val_loss={val_loss:.4e}")

@@ -17,17 +17,17 @@ from src.data.io import ZarrDatasetWriter, ZarrDatasetReader
 
 class TestMockDataset:
     def test_len(self):
-        ds = MockDataset(n_samples=10, spatial_shape=(8, 8), n_omega=4, n_groups=1)
+        ds = MockDataset(n_samples=10, spatial_shape=(8, 8), n_omega=4, n_groups=1, solver_name="mock")
         assert len(ds) == 10
 
     def test_getitem_keys(self):
-        ds = MockDataset(n_samples=5, spatial_shape=(8, 8), n_omega=4, n_groups=1)
+        ds = MockDataset(n_samples=5, spatial_shape=(8, 8), n_omega=4, n_groups=1, solver_name="mock")
         item = ds[0]
         for key in ["sigma_a", "sigma_s", "q", "x", "omega", "w_omega", "I", "phi", "J", "bc", "params"]:
             assert key in item, f"Missing key: {key}"
 
     def test_getitem_shapes(self):
-        ds = MockDataset(n_samples=5, spatial_shape=(8, 8), n_omega=4, n_groups=1)
+        ds = MockDataset(n_samples=5, spatial_shape=(8, 8), n_omega=4, n_groups=1, solver_name="mock")
         item = ds[0]
         Nx = 64
         assert item["x"].shape == (Nx, 2)
@@ -37,13 +37,13 @@ class TestMockDataset:
         assert item["J"].shape == (Nx, 2, 1)
 
     def test_multigroup_shapes(self):
-        ds = MockDataset(n_samples=3, spatial_shape=(8, 8), n_omega=4, n_groups=7)
+        ds = MockDataset(n_samples=3, spatial_shape=(8, 8), n_omega=4, n_groups=7, solver_name="mock")
         item = ds[0]
         assert item["sigma_a"].shape == (64, 7)
         assert item["I"].shape == (64, 4, 7)
 
     def test_3d_shapes(self):
-        ds = MockDataset(n_samples=3, spatial_shape=(4, 4, 4), n_omega=4, n_groups=1)
+        ds = MockDataset(n_samples=3, spatial_shape=(4, 4, 4), n_omega=4, n_groups=1, solver_name="mock")
         item = ds[0]
         Nx = 64
         assert item["x"].shape == (Nx, 3)
@@ -55,7 +55,7 @@ class TestMockDataset:
 class TestCollateFn:
     def test_same_omega_size(self):
         """Batching with same Nw: no padding needed."""
-        ds = MockDataset(n_samples=4, spatial_shape=(8, 8), n_omega=8)
+        ds = MockDataset(n_samples=4, spatial_shape=(8, 8), n_omega=8, solver_name="mock")
         items = [ds[i] for i in range(4)]
         batch = collate_fn(items)
         B = 4
@@ -153,7 +153,8 @@ class TestOmegaResampling:
     def test_resample_dataset(self):
         ds = MockDataset(
             n_samples=5, n_omega=8,
-            resample_omega_range=(4, 12)
+            resample_omega_range=(4, 12),
+            solver_name="mock",
         )
         # Each item might have different Nw; check shapes are consistent
         item = ds[0]

@@ -26,8 +26,6 @@ sys.path.insert(0, str(ROOT))
 # ── benchmark definitions (mirrors eval.py) ─────────────────────────────────
 BENCHMARK_DEFAULTS = {
     "c5g7":      {"spatial_shape": (8, 8),    "n_omega": 8,  "n_groups": 7, "dim": 2},
-    "c5g7_td":   {"spatial_shape": (8, 8),    "n_omega": 8,  "n_groups": 7, "dim": 2},
-    "kobayashi": {"spatial_shape": (4, 4, 4), "n_omega": 8,  "n_groups": 1, "dim": 3},
     "pinte2009": {"spatial_shape": (8, 8),    "n_omega": 8,  "n_groups": 1, "dim": 2},
 }
 
@@ -203,6 +201,7 @@ def test_eval_forward_pass(benchmark, model_name, tmp_path):
         n_groups=bm_def["n_groups"],
         benchmark_name=benchmark,
         seed=0,
+        solver_name="mock",
     )
     from torch.utils.data import DataLoader
     loader = DataLoader(ds, batch_size=2, shuffle=False, collate_fn=collate_fn)
@@ -235,17 +234,58 @@ def test_eval_all_protocols(benchmark, model_name, tmp_path):
     model, device = _load_model(args, bm_def)
 
     from src.data.dataset import MockDataset
-    from src.eval.protocols import SNTransferProtocol, ResolutionTransferProtocol, RegimeSweepProtocol
-
-    test_ds = MockDataset(
-        n_samples=args.n_test_samples,
-        spatial_shape=bm_def["spatial_shape"],
-        n_omega=bm_def["n_omega"],
-        n_groups=bm_def["n_groups"],
-        benchmark_name=benchmark,
-        seed=1,
+    from src.data.io import ZarrDatasetWriter
+    from src.eval.protocols import (
+        TestSetProtocol,
+        SNTransferProtocol,
+        ResolutionTransferProtocol,
+        RegimeSweepProtocol,
     )
-    test_samples = [test_ds._samples[i] for i in range(len(test_ds))]
+
+    data_dir = tmp_path / "datasets"
+    data_dir.mkdir()
+
+    def _write_split(split_name: str, spatial_shape: tuple, n: int, seed: int):
+        ds = MockDataset(
+            n_samples=n, spatial_shape=spatial_shape,
+            n_omega=bm_def["n_omega"], n_groups=bm_def["n_groups"],
+            benchmark_name=benchmark, seed=seed, solver_name="mock",
+        )
+        zarr_path = str(data_dir / f"{benchmark}_{split_name}.zarr")
+        w = ZarrDatasetWriter(zarr_path, mode="w")
+        for i, s in enumerate(ds._samples):
+            w.write(s, idx=i)
+        w.close()
+
+    base_shape = bm_def["spatial_shape"]
+    n = args.n_test_samples
+
+    # Write all splits that the protocols will try to load from disk
+    _write_split("test",          base_shape, n, seed=1)
+    _write_split("resolution_x2", tuple(s * 2 for s in base_shape), n, seed=2)
+    for i_eps, eps in enumerate([0.01, 1.0]):  # matches args.epsilon_values
+        eps_tag = f"{eps:.3f}".rstrip("0").rstrip(".")
+        _write_split(f"regime_eps{eps_tag}", base_shape, n, seed=100 + i_eps)
+
+    test_samples = MockDataset(
+        n_samples=n, spatial_shape=base_shape,
+        n_omega=bm_def["n_omega"], n_groups=bm_def["n_groups"],
+        benchmark_name=benchmark, seed=1, solver_name="mock",
+    )._samples
+
+    # --- Test Set (baseline) ---
+    ts = TestSetProtocol(
+        model=model,
+        test_samples=test_samples,
+        device=str(device),
+        batch_size=args.batch_size,
+    )
+    ts_results = ts.run()
+    assert "test" in ts_results, "TestSetProtocol must return a 'test' key"
+    r = ts_results["test"]
+    for metric in ("I_rel_l2", "phi_rel_l2", "J_rel_l2"):
+        assert metric in r, f"Missing {metric} in test set results"
+        assert r[metric] == r[metric], f"NaN {metric} in test set results"
 
     # --- SN Transfer ---
     sn = SNTransferProtocol(
@@ -262,32 +302,35 @@ def test_eval_all_protocols(benchmark, model_name, tmp_path):
         assert "I_rel_l2" in r, f"Missing I_rel_l2 for n_omega={nw}"
         assert not (r["I_rel_l2"] != r["I_rel_l2"]), f"NaN I_rel_l2 at n_omega={nw}"
 
-    # --- Resolution Transfer ---
+    # --- Resolution Transfer (x1 uses base_test_samples; x2 loads from disk) ---
     res = ResolutionTransferProtocol(
         model=model,
-        base_spatial_shape=bm_def["spatial_shape"],
-        resolution_multipliers=args.resolution_multipliers,
+        base_spatial_shape=base_shape,
+        resolution_multipliers=[1, 2],
         n_groups=bm_def["n_groups"],
         benchmark_name=benchmark,
-        n_test_samples=args.n_test_samples,
+        n_test_samples=n,
         device=str(device),
         batch_size=args.batch_size,
         n_omega=bm_def["n_omega"],
+        base_test_samples=test_samples,
+        data_dir=str(data_dir),
     )
     res_results = res.run()
     assert res_results, "Resolution transfer returned empty results"
 
-    # --- Regime Sweep ---
+    # --- Regime Sweep (all splits loaded from disk) ---
     sweep = RegimeSweepProtocol(
         model=model,
-        epsilon_values=args.epsilon_values,
-        spatial_shape=bm_def["spatial_shape"],
+        epsilon_values=[0.01, 1.0],
+        spatial_shape=base_shape,
         n_omega=bm_def["n_omega"],
         n_groups=bm_def["n_groups"],
         benchmark_name=benchmark,
-        n_test_samples=args.n_test_samples,
+        n_test_samples=n,
         device=str(device),
         batch_size=args.batch_size,
+        data_dir=str(data_dir),
     )
     sweep_results = sweep.run()
     assert sweep_results, "Regime sweep returned empty results"

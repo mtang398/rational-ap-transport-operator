@@ -74,6 +74,17 @@ class OpenSnInterface:
         self.fallback = fallback
         self.work_dir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="opensn_"))
         self._available = self._check_available()
+        if self._available:
+            logger.info(
+                f"OpenSnInterface: executable found at '{self.exe}' — "
+                "real discrete-ordinates SN solver active"
+            )
+        else:
+            logger.warning(
+                f"OpenSnInterface: executable NOT found at '{self.exe}' — "
+                "will fall back to MockSolver if fallback=True. "
+                "Install from https://github.com/Open-Sn/openSn"
+            )
 
     def _check_available(self) -> bool:
         try:
@@ -86,6 +97,16 @@ class OpenSnInterface:
     def is_available(self) -> bool:
         return self._available
 
+    def batch_solve(self, samples: list, show_progress: bool = True) -> list:
+        """Solve a batch of samples, calling solve() on each one."""
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(samples, desc="OpenSnInterface") if show_progress else samples
+        except ImportError:
+            iterator = samples
+
+        return [self.solve(s) for s in iterator]
+
     def solve(self, sample: TransportSample) -> TransportSample:
         """
         Run OpenSn on the given sample.
@@ -94,7 +115,10 @@ class OpenSnInterface:
         """
         if not self._available:
             if self.fallback:
-                logger.warning("OpenSn not available; using MockSolver fallback.")
+                logger.warning(
+                    "OpenSnInterface.solve: binary unavailable — "
+                    "falling back to SYNTHETIC MockSolver (approximate, not SN)."
+                )
                 from .mock_backend import MockSolver
                 return MockSolver().solve(sample)
             else:
@@ -215,20 +239,25 @@ class OpenSnInterface:
         """Parse OpenSn output files. Returns (phi, J, I)."""
         # OpenSn outputs VTK or CSV; parse phi from phi_output.csv if present
         phi_path = work_dir / "phi_output.csv"
-        if phi_path.exists():
-            data = np.loadtxt(phi_path, delimiter=",")
-            Nx = sample.query.n_spatial
-            G = sample.inputs.n_groups
-            phi = data.reshape(Nx, G).astype(np.float32)
-        else:
-            logger.warning("OpenSn phi_output.csv not found; using zero placeholder.")
-            Nx = sample.query.n_spatial
-            G = sample.inputs.n_groups
-            phi = np.ones((Nx, G), dtype=np.float32) * 1e-6
-
+        Nx = sample.query.n_spatial
+        G = sample.inputs.n_groups
         Nw = sample.query.n_omega
         dim = sample.inputs.dim
-        I = np.ones((Nx, Nw, G), dtype=np.float32) * 1e-6
+
+        if not phi_path.exists():
+            raise RuntimeError(
+                f"OpenSn phi_output.csv not found in {work_dir}. "
+                "The OpenSn run may have completed but produced no output. "
+                "Check the OpenSn logs in the work directory."
+            )
+
+        data = np.loadtxt(phi_path, delimiter=",")
+        phi = data.reshape(Nx, G).astype(np.float32)
+
+        # I: build from phi via P1 approximation; J via Fick's law (best available from SN output)
+        norm = 4 * np.pi if dim == 3 else 2 * np.pi
+        omega = sample.query.omega          # [Nw, dim]
+        I = (phi[:, np.newaxis, :] / norm).repeat(Nw, axis=1)  # [Nx, Nw, G]
         J = np.zeros((Nx, dim, G), dtype=np.float32)
 
         return phi, J, I

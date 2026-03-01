@@ -48,20 +48,50 @@ N_MESH      = 51      # tally mesh cells per direction (= 3 × 17)
 GROUP_BOUNDS = [1e-5, 0.058, 0.14, 0.28, 0.625, 4.0, 5530.0, 1e7]  # eV, 8 boundaries
 
 
-def _make_mgxs_library(openmc):
-    """Build the 7-group MGXS library from published C5G7 cross-sections."""
+def _make_mgxs_library(openmc, xs_multipliers: Optional[dict] = None):
+    """
+    Build the 7-group MGXS library from published C5G7 cross-sections.
+
+    Parameters
+    ----------
+    xs_multipliers : dict mapping material name (e.g. 'uo2', 'mox43') to a
+        dict with optional keys 'sigma_a', 'sigma_s', 'nu_fission' each
+        containing a length-7 numpy array of multiplicative factors.
+        When None, the canonical published XS are used unchanged.
+    """
     import openmc.mgxs
     groups = openmc.mgxs.EnergyGroups(np.array(GROUP_BOUNDS))
+    mults = xs_multipliers or {}
 
     def _xs(name, total, absorption, scatter_rows, nu_fission, chi):
+        # Apply per-material multipliers when provided
+        m = mults.get(name, {})
+        abs_arr  = np.array(absorption,  dtype=np.float64)
+        nuf_arr  = np.array(nu_fission,  dtype=np.float64)
+        scat_arr = np.array(scatter_rows, dtype=np.float64)
+
+        if "sigma_a" in m:
+            abs_arr  *= np.asarray(m["sigma_a"], dtype=np.float64)
+        if "nu_fission" in m:
+            nuf_arr  *= np.asarray(m["nu_fission"], dtype=np.float64)
+        if "sigma_s" in m:
+            # Diagonal scatter scaled; off-diagonal scattering left unchanged
+            # to preserve physical downscatter structure.
+            s_mult = np.asarray(m["sigma_s"], dtype=np.float64)  # [G]
+            scat_arr = scat_arr * s_mult[:, np.newaxis]           # scale each source group row
+
+        # Recompute total = absorption + scatter_diagonal (ensure non-negative)
+        scat_diag = np.diag(scat_arr)  # [G] within-group scatter
+        total_arr = np.maximum(abs_arr + scat_diag + np.sum(scat_arr, axis=1) - scat_diag, 1e-8)
+
         xs = openmc.XSdata(name, groups)
         xs.order = 0
-        xs.set_total(np.array(total))
-        xs.set_absorption(np.array(absorption))
-        sm = np.array(scatter_rows)[np.newaxis, :, :]  # shape [1,7,7]
-        sm = np.rollaxis(sm, 0, 3)                      # shape [7,7,1]
-        xs.set_scatter_matrix(sm)
-        xs.set_nu_fission(np.array(nu_fission))
+        xs.set_total(total_arr)
+        xs.set_absorption(np.maximum(abs_arr, 0.0))
+        sm = scat_arr[np.newaxis, :, :]   # shape [1,7,7]
+        sm = np.rollaxis(sm, 0, 3)         # shape [7,7,1]
+        xs.set_scatter_matrix(np.maximum(sm, 0.0))
+        xs.set_nu_fission(np.maximum(nuf_arr, 0.0))
         xs.set_chi(np.array(chi))
         return xs
 
@@ -192,11 +222,19 @@ class C5G7OpenMCModel:
 
     Parameters
     ----------
-    work_dir    : directory where OpenMC writes XML inputs and HDF5 outputs
-    n_particles : Monte Carlo particles per batch
-    n_batches   : total batches (active + inactive)
-    n_inactive  : inactive (source-convergence) batches
-    n_mesh      : tally mesh resolution per direction (default 51 = 3×17)
+    work_dir      : directory where OpenMC writes XML inputs and HDF5 outputs
+    n_particles   : Monte Carlo particles per batch
+    n_batches     : total batches (active + inactive)
+    n_inactive    : inactive (source-convergence) batches
+    n_mesh        : tally mesh resolution per direction (default 51 = 3×17)
+    xs_multipliers: dict mapping material name → per-group multiplier arrays
+                    (shape [7]) applied multiplicatively to sigma_a, sigma_s,
+                    and nu_sigma_f.  When provided, a unique subdirectory is
+                    used for this run (statepoint is NOT reused from a prior
+                    run with different XS) so each perturbed problem gets its
+                    own independent MC solution.
+    sample_id     : optional string appended to the work subdirectory name so
+                    parallel runs do not collide.
     """
 
     def __init__(
@@ -206,12 +244,35 @@ class C5G7OpenMCModel:
         n_batches: int = 300,
         n_inactive: int = 50,
         n_mesh: int = N_MESH,
+        xs_multipliers: Optional[dict] = None,
+        sample_id: Optional[str] = None,
     ):
-        self.work_dir   = Path(work_dir)
-        self.n_particles = int(n_particles)
-        self.n_batches  = int(n_batches)
-        self.n_inactive = int(n_inactive)
-        self.n_mesh     = int(n_mesh)
+        self.n_particles   = int(n_particles)
+        self.n_batches     = int(n_batches)
+        self.n_inactive    = int(n_inactive)
+        self.n_mesh        = int(n_mesh)
+        self.xs_multipliers = xs_multipliers  # None → canonical XS
+
+        # When XS are perturbed each sample needs its own run directory so
+        # the cached statepoint from a different perturbation is never reused.
+        base = Path(work_dir)
+        if xs_multipliers is not None and sample_id is not None:
+            self.work_dir = base / f"sample_{sample_id}"
+        elif xs_multipliers is not None:
+            # Fall back to a hash of the multiplier values so identical
+            # perturbations can share a cached statepoint.
+            import hashlib, json as _json
+            h = hashlib.md5(
+                _json.dumps(
+                    {k: v.tolist() if hasattr(v, "tolist") else v
+                     for k, v in xs_multipliers.items()},
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest()[:10]
+            self.work_dir = base / f"xs_{h}"
+        else:
+            self.work_dir = base  # canonical run — statepoint reuse is safe
+
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -272,7 +333,7 @@ class C5G7OpenMCModel:
         import openmc.mgxs
 
         # 1 – MGXS library
-        lib = _make_mgxs_library(openmc)
+        lib = _make_mgxs_library(openmc, self.xs_multipliers)
         mgxs_path = self.work_dir / "mgxs.h5"
         lib.export_to_hdf5(str(mgxs_path))
 
@@ -397,7 +458,17 @@ class C5G7OpenMCModel:
         settings.inactive       = self.n_inactive
         settings.particles      = self.n_particles
         settings.run_mode       = 'eigenvalue'
-        settings.output         = {'tallies': True, 'summary': True}
+        # output['path'] tells OpenMC where to write all output files (statepoint,
+        # summary, tallies).  Using an absolute path avoids the cwd-relative HDF5
+        # write failure that occurs when the process working directory differs from
+        # the directory where the XML input files were exported.
+        settings.output         = {
+            'tallies': True,
+            'summary': True,
+            'path':    str(self.work_dir.resolve()),
+        }
+        # Write statepoint only at the final batch.
+        settings.statepoint     = {'batches': [self.n_batches]}
         # Initial source: uniform in fissionable region (quarter of core)
         settings.source = openmc.IndependentSource(
             space=openmc.stats.Box(

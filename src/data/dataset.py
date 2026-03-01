@@ -231,10 +231,31 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     return out
 
 
-def resample_omega_directions(sample: TransportSample, n_omega_new: int, rng: Optional[np.random.Generator] = None) -> TransportSample:
+def resample_omega_directions(
+    sample: TransportSample,
+    n_omega_new: int,
+    rng: Optional[np.random.Generator] = None,
+    random: bool = False,
+) -> TransportSample:
     """
-    Resample angular directions and recompute targets at new omega set.
-    For mock data: regenerates I from the analytic formula.
+    Resample angular directions and recompute I at the new omega set.
+
+    By default (random=False) uses the same regular-grid convention as the
+    C5G7/Kobayashi converters (``np.linspace`` angles), so that SN-transfer
+    evaluation tests generalisation across *different SN orders* rather than
+    across random quadrature sets that the model was never trained on.
+
+    When random=True a random quadrature is drawn from ``rng``.  Use this only
+    for data-augmentation during training (so the model truly learns
+    discretisation-agnosticism) — NOT for the SN-transfer evaluation protocol.
+
+    Uses the P1 approximation with the sample's stored J (current) so that
+    real-MC-derived angular structure is preserved:
+
+        I(x, Ω) = φ/(norm) * max(0, 1 + (3/norm) * J·Ω / φ)
+
+    where norm = 2π (2D) or 4π (3D).  If J is all-zero (e.g. pure isotropic
+    mock data), this reduces to the isotropic formula φ/norm.
     """
     from .schema import QueryPoints, TargetFields
     import copy
@@ -247,26 +268,39 @@ def resample_omega_directions(sample: TransportSample, n_omega_new: int, rng: Op
     Nx = sample.query.n_spatial
 
     if dim == 2:
-        angles = rng.uniform(0, 2 * np.pi, n_omega_new).astype(np.float32)
+        if random:
+            # Random quadrature — use for training augmentation only
+            offset = rng.uniform(0, 2 * np.pi / n_omega_new)
+            angles = (np.linspace(0, 2 * np.pi, n_omega_new, endpoint=False) + offset).astype(np.float32)
+        else:
+            # Regular SN grid — matches converter convention (linspace)
+            angles = np.linspace(0, 2 * np.pi, n_omega_new, endpoint=False, dtype=np.float32)
         omega_new = np.stack([np.cos(angles), np.sin(angles)], axis=-1)
         w_new = np.ones(n_omega_new, dtype=np.float32) * (2 * np.pi / n_omega_new)
     else:
-        phi = rng.uniform(0, 2 * np.pi, n_omega_new).astype(np.float32)
-        costh = rng.uniform(-1, 1, n_omega_new).astype(np.float32)
-        sinth = np.sqrt(1 - costh**2)
-        omega_new = np.stack([sinth * np.cos(phi), sinth * np.sin(phi), costh], axis=-1)
+        if random:
+            phi_ang = rng.uniform(0, 2 * np.pi, n_omega_new).astype(np.float32)
+            costh = rng.uniform(-1, 1, n_omega_new).astype(np.float32)
+        else:
+            # Lebedev-like regular azimuthal / Gauss-Legendre polar for 3D
+            phi_ang = np.linspace(0, 2 * np.pi, n_omega_new, endpoint=False, dtype=np.float32)
+            # Uniform in cos(theta) gives equal-area slices
+            costh = np.linspace(-1 + 1.0 / n_omega_new, 1 - 1.0 / n_omega_new, n_omega_new, dtype=np.float32)
+        sinth = np.sqrt(np.maximum(1 - costh**2, 0.0))
+        omega_new = np.stack([sinth * np.cos(phi_ang), sinth * np.sin(phi_ang), costh], axis=-1)
         w_new = np.ones(n_omega_new, dtype=np.float32) * (4 * np.pi / n_omega_new)
 
-    g = sample.inputs.params.get("g", 0.0)
-    z_hat = np.zeros(dim, dtype=np.float32)
-    z_hat[-1] = 1.0
-    mu_new = (omega_new @ z_hat).reshape(1, n_omega_new)
-    phase_new = 1.0 + g * mu_new
-
-    # phi is independent of omega (scalar flux)
-    phi_vals = sample.targets.phi  # [Nx, G]
+    # P1 intensity: use stored J so real MC angular structure is retained.
+    # J: [Nx, dim, G], omega_new: [Nw_new, dim]
+    phi_vals = sample.targets.phi          # [Nx, G]
+    J_vals   = sample.targets.J            # [Nx, dim, G]
     norm = 4 * np.pi if dim == 3 else 2 * np.pi
-    I_new = (phi_vals[:, np.newaxis, :] * phase_new[:, :, np.newaxis]) / norm  # [Nx, Nw_new, G]
+
+    phi_safe = np.maximum(phi_vals, 1e-30)                                # [Nx, G]
+    JdotOmega = np.einsum('xdg,wd->xwg', J_vals, omega_new)              # [Nx, Nw_new, G]
+    correction = 1.0 + (3.0 / norm) * JdotOmega / phi_safe[:, np.newaxis, :]
+    correction = np.maximum(correction, 0.0)
+    I_new = (phi_vals[:, np.newaxis, :] / norm * correction).astype(np.float32)  # [Nx, Nw_new, G]
 
     new_query = copy.copy(sample.query)
     new_query = QueryPoints(
@@ -293,8 +327,17 @@ def resample_omega_directions(sample: TransportSample, n_omega_new: int, rng: Op
     return new_sample
 
 
-class MockDataset(TransportDataset):
-    """Convenience: creates an in-memory mock dataset without disk I/O."""
+class SolverDataset(TransportDataset):
+    """
+    In-memory dataset generated on-the-fly using the converter + solver pipeline.
+
+    Tries to use the best available real solver (OpenMC / OpenSn) for the
+    given benchmark.  Falls back to the analytic MockSolver only when no real
+    solver binary is detected, logging a WARNING in that case.
+
+    This replaces the old MockDataset which always used analytic approximations
+    regardless of what solvers were installed.
+    """
 
     def __init__(
         self,
@@ -302,28 +345,79 @@ class MockDataset(TransportDataset):
         spatial_shape: tuple = (16, 16),
         n_omega: int = 8,
         n_groups: int = 1,
-        benchmark_name: str = "mock",
+        benchmark_name: str = "c5g7",
         epsilon_range: Tuple[float, float] = (0.01, 1.0),
         seed: int = 42,
         resample_omega_range: Optional[Tuple[int, int]] = None,
+        solver_name: str = "auto",
+        xs_perturb: float = 0.10,
     ):
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+
+        from ..solvers import get_solver, detect_best_solver
+        from .converters import (
+            C5G7Converter, Pinte2009Converter,
+        )
+
+        converter_map = {
+            "c5g7":      C5G7Converter,
+            "pinte2009": Pinte2009Converter,
+        }
+
         rng = np.random.default_rng(seed)
-        samples = []
-        for i in range(n_samples):
-            eps = float(rng.uniform(*epsilon_range))
-            g = float(rng.uniform(-0.5, 0.9))
-            s = make_mock_sample(
-                spatial_shape=spatial_shape,
-                n_omega=n_omega,
-                n_groups=n_groups,
-                benchmark_name=benchmark_name,
-                epsilon=eps,
-                g=g,
-                rng=rng,
+        resolved = detect_best_solver(benchmark_name) if solver_name == "auto" else solver_name
+        ConverterCls = converter_map.get(benchmark_name)
+
+        if ConverterCls is not None and resolved != "mock":
+            # Use real converter + solver
+            solver = get_solver(resolved, benchmark=benchmark_name, fallback=True)
+            _log.info(
+                f"SolverDataset [{benchmark_name}]: generating {n_samples} samples "
+                f"with {resolved} solver (shape={spatial_shape})"
             )
-            samples.append(s)
+            conv = ConverterCls()
+            eps_vals = rng.uniform(*epsilon_range, size=n_samples).tolist()
+            samples = []
+            for i, eps in enumerate(eps_vals):
+                s_list = conv.convert(
+                    n_samples=1,
+                    spatial_shape=spatial_shape,
+                    n_omega=n_omega,
+                    rng=rng,
+                    epsilon=float(eps),
+                    xs_perturb=xs_perturb,
+                )
+                samples.extend(solver.batch_solve(s_list, show_progress=False))
+        else:
+            # No real solver available — fall back to analytic MockSolver
+            _log.warning(
+                f"SolverDataset [{benchmark_name}]: no real solver available "
+                f"(resolved='{resolved}') — using analytic MockSolver approximation. "
+                "Install OpenMC or OpenSn for physically accurate labels."
+            )
+            solver = get_solver("mock")
+            samples = []
+            for i in range(n_samples):
+                eps = float(rng.uniform(*epsilon_range))
+                g = float(rng.uniform(-0.5, 0.9))
+                s = make_mock_sample(
+                    spatial_shape=spatial_shape,
+                    n_omega=n_omega,
+                    n_groups=n_groups,
+                    benchmark_name=benchmark_name,
+                    epsilon=eps,
+                    g=g,
+                    rng=rng,
+                )
+                samples.append(solver.solve(s))
 
         super().__init__(
             source=samples,
             resample_omega_range=resample_omega_range,
         )
+
+
+# Backward-compatible alias — existing code that imports MockDataset continues to
+# work, but now automatically prefers real solvers.
+MockDataset = SolverDataset

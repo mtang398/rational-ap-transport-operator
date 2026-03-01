@@ -7,14 +7,14 @@
 #
 # Flags:
 #   --quick      Use tiny datasets and 5 epochs (for CI/smoke testing)
-#   --benchmark  Specific benchmark (default: all 4)
+#   --benchmark  Specific benchmark (default: c5g7 pinte2009)
 #   --model      Specific model (default: all 3)
 # =============================================================================
 
 set -e  # exit on error
 
 QUICK=0
-BENCHMARKS="mock_c5g7 mock_c5g7_td mock_kobayashi mock_pinte2009"
+BENCHMARKS="c5g7 pinte2009"
 MODELS="fno deeponet ap_micromacro"
 RESULTS_DIR="runs/aggregate"
 EPOCHS=20
@@ -48,11 +48,11 @@ append_csv() {
 for BENCHMARK in $BENCHMARKS; do
     log "===== Benchmark: $BENCHMARK ====="
 
-    # --- Generate dataset ---
-    log "  Generating dataset..."
+    # --- Generate dataset (auto: real solver if available, mock fallback) ---
+    log "  Generating dataset (solver=auto)..."
     python scripts/generate_dataset.py \
         --benchmark "$BENCHMARK" \
-        --solver mock \
+        --solver auto \
         --n_samples "$N_SAMPLES" \
         --split train \
         --output_dir runs/datasets \
@@ -60,11 +60,19 @@ for BENCHMARK in $BENCHMARKS; do
 
     python scripts/generate_dataset.py \
         --benchmark "$BENCHMARK" \
-        --solver mock \
+        --solver auto \
         --n_samples "$((N_SAMPLES / 4))" \
         --split val \
         --output_dir runs/datasets \
         --seed 123
+
+    python scripts/generate_dataset.py \
+        --benchmark "$BENCHMARK" \
+        --solver auto \
+        --n_samples "$((N_SAMPLES / 4))" \
+        --split test \
+        --output_dir runs/datasets \
+        --seed 456
 
     log "  Dataset generated."
 
@@ -73,7 +81,7 @@ for BENCHMARK in $BENCHMARKS; do
         RUN_NAME="${BENCHMARK}_${MODEL}"
         CKPT_DIR="runs/${RUN_NAME}/checkpoints"
 
-        # --- Smoke training ---
+        # --- Smoke training (loads real data from disk if available) ---
         log "    Training..."
         python train.py \
             --benchmark "$BENCHMARK" \
@@ -83,6 +91,7 @@ for BENCHMARK in $BENCHMARKS; do
             --run_name "$RUN_NAME" \
             --seed 42 \
             --log_dir runs \
+            --data_dir runs/datasets \
             || { log "    FAILED: $MODEL training on $BENCHMARK"; continue; }
 
         CKPT="${CKPT_DIR}/best.pt"
@@ -103,6 +112,7 @@ for BENCHMARK in $BENCHMARKS; do
             --model "$MODEL" \
             --protocol sn_transfer \
             --output_dir "runs/eval/${RUN_NAME}" \
+            --data_dir runs/datasets \
             --seed 42 \
             && append_csv "$BENCHMARK" "$MODEL" "sn_transfer" "see runs/eval/${RUN_NAME}/sn_transfer.csv"
 
@@ -114,21 +124,21 @@ for BENCHMARK in $BENCHMARKS; do
             --model "$MODEL" \
             --protocol resolution_transfer \
             --output_dir "runs/eval/${RUN_NAME}" \
+            --data_dir runs/datasets \
             --seed 42 \
             && append_csv "$BENCHMARK" "$MODEL" "resolution_transfer" "see runs/eval/${RUN_NAME}/resolution_transfer.csv"
 
-        # --- Regime sweep eval (for non-3D benchmarks) ---
-        if [[ "$BENCHMARK" != "mock_kobayashi" ]]; then
-            log "    Regime sweep eval..."
-            python eval.py \
-                --checkpoint "$CKPT" \
-                --benchmark "$BENCHMARK" \
-                --model "$MODEL" \
-                --protocol regime_sweep \
-                --output_dir "runs/eval/${RUN_NAME}" \
-                --seed 42 \
-                && append_csv "$BENCHMARK" "$MODEL" "regime_sweep" "see runs/eval/${RUN_NAME}/regime_sweep.csv"
-        fi
+        # --- Regime sweep eval (pinte2009 only; c5g7 is skipped by eval.py) ---
+        log "    Regime sweep eval..."
+        python eval.py \
+            --checkpoint "$CKPT" \
+            --benchmark "$BENCHMARK" \
+            --model "$MODEL" \
+            --protocol regime_sweep \
+            --output_dir "runs/eval/${RUN_NAME}" \
+            --data_dir runs/datasets \
+            --seed 42 \
+            && append_csv "$BENCHMARK" "$MODEL" "regime_sweep" "see runs/eval/${RUN_NAME}/regime_sweep.csv"
 
         log "    Done: $MODEL on $BENCHMARK"
     done

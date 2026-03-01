@@ -6,7 +6,7 @@ n_samples_train: 150
 n_samples_val: 40
 n_samples_test: 40
 epsilon_range: [0.001, 0.1]
-solver: lambda_iteration
+solver: auto
 raw_dir: null
 time_dependent: false
 wavelength_um: 1.0

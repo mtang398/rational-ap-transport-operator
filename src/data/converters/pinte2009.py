@@ -56,7 +56,7 @@ Expected raw files (data/raw/pinte2009/):
 from __future__ import annotations
 import logging
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import numpy as np
 
@@ -234,9 +234,16 @@ class Pinte2009Converter:
             return False
         return (self.raw_dir / "density_grid.npy").exists()
 
-    def convert(self, n_samples: int = 10, spatial_shape: tuple = (32, 32),
-                n_omega: int = 16, rng: Optional[np.random.Generator] = None,
-                epsilon: float = 1.0) -> List[TransportSample]:
+    def convert(
+        self,
+        n_samples: int = 10,
+        spatial_shape: tuple = (32, 32),
+        n_omega: int = 16,
+        rng: Optional[np.random.Generator] = None,
+        epsilon: float = 1.0,
+        epsilon_range: Optional[Tuple[float, float]] = None,
+        xs_perturb: float = 0.10,
+    ) -> List[TransportSample]:
         if rng is None:
             rng = np.random.default_rng(3)
         if self._has_raw:
@@ -244,38 +251,71 @@ class Pinte2009Converter:
             return self._convert_raw(n_samples, spatial_shape, n_omega)
         logger.info(f"Pinte2009: building from published disk model at "
                     f"λ={self.wavelength_um} μm (κ_abs={self._kappa_abs:.2f}, "
-                    f"κ_sca={self._kappa_sca:.2f}, g={self._g:.2f}).")
-        return self._generate_from_model(n_samples, spatial_shape, n_omega, rng, epsilon)
+                    f"κ_sca={self._kappa_sca:.2f}, g={self._g:.2f}, "
+                    f"xs_perturb={xs_perturb:.0%}).")
+        return self._generate_from_model(
+            n_samples, spatial_shape, n_omega, rng, epsilon, epsilon_range, xs_perturb
+        )
 
     # ── core builder ──────────────────────────────────────────────────────────
 
     def _make_pinte_sample(self, spatial_shape: tuple, n_omega: int,
                            rng: np.random.Generator, epsilon: float,
-                           idx: int, perturb: bool = True) -> TransportSample:
+                           idx: int, xs_perturb: float = 0.10) -> TransportSample:
         nr, ntheta = spatial_shape
         G  = self.N_GROUPS
         lam = self.wavelength_um
 
-        # Perturb physical parameters slightly across samples
-        kappa_abs = self._kappa_abs * (rng.uniform(0.9, 1.1) if perturb else 1.0)
-        kappa_sca = self._kappa_sca * (rng.uniform(0.9, 1.1) if perturb else 1.0)
-        g_param   = float(np.clip(self._g * rng.uniform(0.9, 1.1)
-                                  if perturb else self._g, 0.0, 0.99))
+        # Perturb dust opacity parameters independently per sample
+        lo, hi = 1.0 - xs_perturb, 1.0 + xs_perturb
+        kappa_abs = self._kappa_abs * (float(rng.uniform(lo, hi)) if xs_perturb > 0.0 else 1.0)
+        kappa_sca = self._kappa_sca * (float(rng.uniform(lo, hi)) if xs_perturb > 0.0 else 1.0)
+        g_param   = float(np.clip(
+            self._g * (float(rng.uniform(lo, hi)) if xs_perturb > 0.0 else 1.0),
+            0.0, 0.99,
+        ))
+
+        # Per-sample disk geometry variation (flaring index, scale height, inner cavity):
+        # These change the density structure, producing genuinely different RT problems.
+        if xs_perturb > 0.0:
+            xi_scale   = float(rng.uniform(0.8, 1.2))   # flaring index  ±20 %
+            h0_scale   = float(rng.uniform(0.7, 1.3))   # scale height   ±30 %
+            r_in_scale = float(rng.uniform(0.7, 1.3))   # inner radius   ±30 %
+        else:
+            xi_scale = h0_scale = r_in_scale = 1.0
+        xi_flare_i  = float(np.clip(XI_FLARE  * xi_scale,  0.10, 0.50))
+        h0_over_i   = float(np.clip(H0_OVER_RREF * h0_scale, 0.02, 0.15))
+        r_in_i      = float(np.clip(R_IN_AU   * r_in_scale, 50.0, 200.0))
 
         # Polar grid (r, elevation angle z/r from midplane)
-        r_vals     = np.linspace(R_IN_AU,  R_OUT_AU,  nr,     dtype=np.float32)
+        r_vals     = np.linspace(r_in_i,   R_OUT_AU,  nr,     dtype=np.float32)
         theta_vals = np.linspace(-0.5,     0.5,       ntheta, dtype=np.float32)  # z/r
         RR, TT = np.meshgrid(r_vals, theta_vals, indexing="ij")   # [nr, ntheta]
 
-        rho = _disk_density(RR, TT)   # [nr, ntheta], g/cm^3
+        # Compute density with per-sample geometry parameters
+        r_clipped = np.clip(RR, r_in_i, R_OUT_AU)
+        H_au      = h0_over_i * R_REF * (r_clipped / R_REF) ** (1 + xi_flare_i)
+        Sigma     = SIGMA_0 * (r_clipped / R_REF) ** P_SIGMA
+        z_au      = TT * RR
+        rho       = np.clip(
+            (Sigma / (np.sqrt(2 * np.pi) * H_au)) * np.exp(-0.5 * (z_au / H_au) ** 2),
+            1e-40, 1.0,
+        ).astype(np.float32)   # [nr, ntheta], g/cm^3
 
         # Macroscopic opacities [nr, ntheta, 1] in cm^-1
         sigma_a = (kappa_abs * rho * AU_TO_CM)[..., np.newaxis].astype(np.float32)
         sigma_s = (kappa_sca * rho * AU_TO_CM)[..., np.newaxis].astype(np.float32)
 
-        # Stellar irradiation source (concentrated near star)
+        # Stellar irradiation source (concentrated near star).
+        # Vary stellar flux ±20% per sample to model different stellar luminosities
+        # (this is the primary BC input that drives the radiative transfer solution).
+        B_lam_ref = _planck_function(lam, T_EFF)   # erg/s/cm^2/cm/sr
+        if xs_perturb > 0.0:
+            lum_scale = float(rng.uniform(0.8, 1.2))
+        else:
+            lum_scale = 1.0
+        B_lam = B_lam_ref * lum_scale
         q = np.zeros((nr, ntheta, G), dtype=np.float32)
-        B_lam = _planck_function(lam, T_EFF)   # erg/s/cm^2/cm/sr
         # Place source energy in innermost radial cells (stellar surface heating)
         n_src = max(1, nr // 10)
         q[:n_src, ntheta // 2 - 1:ntheta // 2 + 2, 0] = float(B_lam) * np.pi
@@ -302,16 +342,35 @@ class Pinte2009Converter:
 
         phi_vals = I_vals.mean(axis=1)   # [Nx, G]
 
-        # Current via flux gradient
+        # Current via flux gradient, with D clamped to prevent blow-up in near-vacuum.
+        # In protoplanetary disk models, the inner region near the star has extremely
+        # low density → sigma ≈ 0 → D = 1/(3σ) → ∞.  We cap D so |J| ≤ phi (flux
+        # limiter), which is the physically correct free-streaming limit.
         phi_grid = phi_vals.reshape(nr, ntheta, G)
         dr = (R_OUT_AU - R_IN_AU) / max(nr - 1, 1) * AU_TO_CM
         dt = 1.0 / max(ntheta - 1, 1)
-        D_flat = 1.0 / (3.0 * np.maximum(sigma_a + sigma_s, 1e-40).reshape(Nx, G))
-        dphidr = np.gradient(phi_grid, dr,   axis=0).reshape(Nx, G)
-        dphidt = np.gradient(phi_grid, dt,   axis=1).reshape(Nx, G)
-        Jx = -D_flat * dphidr
-        Jy = -D_flat * dphidt
+        dphidr = np.gradient(phi_grid, dr, axis=0).reshape(Nx, G)
+        dphidt = np.gradient(phi_grid, dt, axis=1).reshape(Nx, G)
+        grad_mag = np.sqrt(dphidr**2 + dphidt**2) + 1e-30            # [Nx, G]
+        phi_safe_fl = np.maximum(phi_vals, 1e-30)                     # [Nx, G]
+        # D_raw = 1/(3σ), but clamp so D * |∇φ| ≤ φ  (flux-limited diffusion)
+        D_raw = 1.0 / (3.0 * np.maximum((sigma_a + sigma_s).reshape(Nx, G), 1e-30))
+        D_flat = np.minimum(D_raw, phi_safe_fl / (grad_mag + 1e-30))
+        Jx = (-D_flat * dphidr).astype(np.float32)
+        Jy = (-D_flat * dphidt).astype(np.float32)
         J_vals = np.stack([Jx, Jy], axis=1)   # [Nx, 2, G]
+
+        # Replace lambda-iteration I_vals with P1-corrected version using
+        # J_fick as the angular-variation driver.
+        # I(x,Ω) = φ/(2π) * [1 + (3·J_fick·Ω) / (2π·φ + ε)]
+        phi_safe = np.maximum(phi_vals, 1e-30)
+        JdotOmega = np.einsum('xdg,wd->xwg', J_vals, omega)   # J_vals is J_fick here
+        correction = 1.0 + (3.0 / (2 * np.pi)) * JdotOmega / phi_safe[:, np.newaxis, :]
+        correction = np.maximum(correction, 0.0)
+        I_vals = (phi_vals[:, np.newaxis, :] / (2 * np.pi) * correction).astype(np.float32)
+
+        # J stored = angular quadrature moment of I (self-consistent with model)
+        J_vals = np.einsum('w,wd,nwg->ndg', w_omega, omega, I_vals).astype(np.float32)
 
         # Stokes Q and U (linear polarisation proxies)
         # Polarisation fraction for single-scattering Rayleigh: ~10% in disk
@@ -328,7 +387,7 @@ class Pinte2009Converter:
             q        = q,
             bc       = bc,
             params   = {"epsilon": epsilon, "g": g_param,
-                        "wavelength_um": lam},
+                        "wavelength_um": lam, "lum_scale": lum_scale},
             metadata = {
                 "benchmark_name": self.BENCHMARK_NAME,
                 "dim": 2, "group_count": G,
@@ -337,8 +396,12 @@ class Pinte2009Converter:
                 "kappa_sca_cm2g": kappa_sca,
                 "L_star_Lsun": L_STAR / L_SUN,
                 "T_eff_K": T_EFF,
-                "R_in_AU": R_IN_AU,
+                "R_in_AU": r_in_i,
                 "R_out_AU": R_OUT_AU,
+                "xi_flare": xi_flare_i,
+                "h0_over_rref": h0_over_i,
+                "B_lam_scaled": float(B_lam),
+                "lum_scale": lum_scale,
                 "intensity_model": "lambda_iteration_5",
             },
         )
@@ -356,13 +419,21 @@ class Pinte2009Converter:
             sample_id=f"pinte2009_{idx:04d}",
         )
 
-    def _generate_from_model(self, n_samples: int, spatial_shape: tuple,
-                             n_omega: int, rng: np.random.Generator,
-                             epsilon: float) -> List[TransportSample]:
+    def _generate_from_model(
+        self,
+        n_samples: int,
+        spatial_shape: tuple,
+        n_omega: int,
+        rng: np.random.Generator,
+        epsilon: float,
+        epsilon_range: Optional[Tuple[float, float]] = None,
+        xs_perturb: float = 0.10,
+    ) -> List[TransportSample]:
         samples = []
         for i in range(n_samples):
+            eps_i = float(rng.uniform(*epsilon_range)) if epsilon_range is not None else epsilon
             sample = self._make_pinte_sample(
-                spatial_shape, n_omega, rng, epsilon, i, perturb=(i > 0)
+                spatial_shape, n_omega, rng, eps_i, i, xs_perturb=xs_perturb
             )
             samples.append(sample)
         return samples

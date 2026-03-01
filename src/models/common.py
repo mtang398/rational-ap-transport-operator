@@ -380,15 +380,21 @@ class ParamEncoder(nn.Module):
         self.epsilon_idx = param_keys.index("epsilon") if "epsilon" in param_keys else -1
         self.net = MLP(n_params, out_dim, [hidden_dim], activation="silu")
 
-    def forward(self, params: Tensor) -> Tensor:
+    def forward(self, params: Tensor, batch_param_keys: Optional[List[str]] = None) -> Tensor:
         """
         Args:
-            params: [B, n_params]
+            params: [B, n_params_in_batch]  — may have more columns than self.param_keys
+            batch_param_keys: list of key names matching columns of params.
+                              If provided, selects only the columns in self.param_keys.
         Returns:
             [B, out_dim]
         """
+        if batch_param_keys is not None and batch_param_keys != self.param_keys:
+            # Select only the columns this encoder was built for, in the right order
+            indices = [batch_param_keys.index(k) for k in self.param_keys if k in batch_param_keys]
+            params = params[:, indices]
+
         p = params.clone()
         if self.epsilon_idx >= 0:
-            # Log-scale epsilon (spans many decades from diffusion to transport)
             p[:, self.epsilon_idx] = torch.log(params[:, self.epsilon_idx].clamp(min=1e-6))
         return self.net(p)

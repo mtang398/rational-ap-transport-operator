@@ -1,36 +1,22 @@
-# Discretization-Agnostic Neural Operators for Radiative/Particle Transport
+# Rational AP Transport Operator
 
-A PyTorch research repository implementing baseline neural operator models for
-radiative and particle transport. The core goal is to learn the **solution operator**
+A PyTorch research codebase for learning the **solution operator of radiative/particle transport**:
 
 > **T : (σ_a, σ_s, q, BC, ε, g) → I(x, ω)**
 
-where the model is queried at arbitrary spatial points **x** and angular directions
-**ω** at evaluation time — no re-training needed when the discretization changes.
+The model is queried at arbitrary spatial points **x** and angular directions **ω** at evaluation time — no retraining when the discretization changes.
 
 ---
 
 ## Research Goal
 
-The central goal is to develop and rigorously evaluate an **asymptotic-preserving,
-discretization-agnostic neural operator for radiative/particle transport** that maps
+The goal is to develop and evaluate an **asymptotic-preserving, discretization-agnostic neural operator** that maps cross-section fields, sources, boundary conditions, and transport regime parameter ε to the full angular intensity I(x, ω) and its derived moments (φ, J). Each training sample is a genuinely different physics problem — independently perturbed cross-sections, source strengths, boundary conditions, and transport regime — not just the same physics at different resolutions.
 
-> **(σ_a, σ_s, q, BCs, ε, anisotropy) → I(x, ω)** (and derived moments φ, J, QoIs)
-
-and to test whether **trainable rational activation functions** materially improve
-generalization across three axes relative to standard activations (ReLU/GELU/SiLU):
+The central scientific question is whether **trainable rational activation functions** materially improve generalization across three axes relative to standard activations (ReLU/GELU/SiLU):
 
 1. **SN order transfer** — trained on S8, evaluated on S4 / S16 / S32 / S64
-2. **Spatial resolution transfer** — trained on 17×17, evaluated on 34×34 / 68×68
-3. **Cross-regime (ε sweep)** — trained across ε ∈ [0.01, 1], evaluated at ε → 0
-   (diffusion limit) and ε = 1 (transport limit)
-
-All three axes are tested on **C5G7 MOX, C5G7-TD, Kobayashi 3D void**, and
-**Pinte et al. 2009** benchmarks.
-
-Rational activations — learnable piecewise-rational functions that adapt their
-shape during training — are the candidate nonlinearity being tested across all
-three model families (FNO, DeepONet, AP Micro-Macro).
+2. **Spatial resolution transfer** — trained at base resolution, evaluated at 2× / 4× finer grids
+3. **Cross-regime (ε sweep)** — trained across ε ∈ [0.01, 1], evaluated at ε → 0 (diffusion limit) and ε = 1 (transport limit)
 
 ---
 
@@ -38,649 +24,224 @@ three model families (FNO, DeepONet, AP Micro-Macro).
 
 ### The core difficulty: stiffness across regimes
 
-The scaled linear transport equation reads
+The scaled linear transport equation reads:
 
-> **ε ∂_t I + Ω·∇I = (1/ε)(⟨I⟩ − I) + source**
+> **Ω·∇I = (1/ε)(⟨I⟩ − I) + source**
 
-where ε is the Knudsen number (mean free path / domain size). When **ε = O(1)**
-(transport regime) the angular variable Ω matters: the solution is anisotropic,
-with strong directional flux near sources and in voids. When **ε → 0**
-(diffusion regime) the collision term dominates, the solution becomes nearly
-isotropic, and I(x,ω) ≈ φ(x)/(4π) everywhere — the full angular dependence
-collapses to a scalar.
+where ε is the Knudsen number (mean free path / domain size). When **ε = O(1)** (transport regime) the angular variable Ω matters and the solution is strongly anisotropic. When **ε → 0** (diffusion regime) the collision term dominates, the solution becomes nearly isotropic, and I(x,ω) ≈ φ(x)/(4π) everywhere — the full angular dependence collapses to a scalar.
 
-A plain neural network (FNO, DeepONet) trained across all ε must learn both
-extremes from the same weights. The diffusion limit and the transport limit
-require qualitatively different representations, so the network tends to average
-them and do neither well — this is precisely the failure mode that standard
-PINNs exhibit on multiscale problems, as demonstrated in the APNN literature
-[[Jin & Ma 2022](#asymptotic-preserving-methods-ap--apnn),
-[Li et al. 2022](#asymptotic-preserving-methods-ap--apnn),
-[Bertaglia 2022](#asymptotic-preserving-methods-ap--apnn)].
+A plain neural network (FNO, DeepONet) trained across all ε must learn both extremes from the same weights, and tends to average them and do neither well. This is the failure mode that asymptotic-preserving methods are designed to avoid.
 
 ### The decomposition
 
-The AP Micro-Macro model avoids this by **hard-coding the diffusion limit into
-the architecture**. The intensity is split as:
+The AP Micro-Macro model avoids this by **hard-coding the diffusion limit into the architecture**:
 
 ```
-I(x, ω) = I_P1(x, ω)   +   R(x, ω)
-           ────────────      ────────
-           MacroNet          MicroNet
-           (FNO → φ, J)      (MLP residual)
-           deterministic      learned
-           P1 closure
+I(x, ω)  =  I_P1(x, ω)           +   R(x, ω)
+             ─────────────────         ──────────────
+             MacroNet output           MicroNet output
+             deterministic P1          learned residual
+             φ(x)/(2π) + J(x)·ω·1/π   captures anisotropy
+                                        beyond P1
 ```
 
-**I_P1** is not learned — it is the explicit P1 angular reconstruction:
+**I_P1** is not learned — it is the explicit P1 angular reconstruction from MacroNet's predicted moments:
+- 2D: `I_P1(x,ω) = φ(x)/(2π) + (1/π) J(x)·ω`
+- 3D: `I_P1(x,ω) = φ(x)/(4π) + (3/4π) J(x)·ω`
 
-```
-I_P1(x, ω) = φ(x)/(4π) + (3/4π) J(x)·ω      [3D]
-I_P1(x, ω) = φ(x)/(2π) + (2/2π) J(x)·ω      [2D]
-```
+This is the leading-order Chapman-Enskog term; it integrates to give φ exactly and its first angular moment gives J exactly. It is isotropic when J = 0, which is precisely the diffusion limit.
 
-This is the leading-order term of the Chapman-Enskog expansion of the transport
-equation [[Pomraning 1973](#asymptotic-preserving-methods-ap--apnn)]. It
-integrates to give φ exactly, its first angular moment gives J exactly, and it
-is isotropic when J = 0 — all of which are required by the diffusion limit.
+**MacroNet** (FNO-based) predicts the spatial moments φ(x) and J(x) from the full input fields (σ_a, σ_s, q, BC). The FNO backbone captures global spatial correlations across the domain.
 
-**MacroNet** (FNO-based) predicts the spatial moments φ(x) and J(x) by
-processing the full input fields (σ_a, σ_s, q, BC) on a spatial grid. FNO is
-used here because global spatial correlations matter: in a reactor core the flux
-shape at one pin depends on the geometry of the entire assembly.
+**MicroNet** (MLP-based) predicts the angular residual R(x, ω) — the deviation from P1. It takes MacroNet's spatial latent, Fourier features of ω, and log(ε) as input, allowing it to learn to suppress corrections in the diffusion regime (where P1 is already accurate).
 
-**MicroNet** (MLP-based) predicts the angular residual R(x, ω) — the deviation
-from the P1 reconstruction. R captures transport effects that P1 cannot:
-directional streaming in voids, angular peaking near strong sources, boundary
-layers. The MicroNet takes as input the spatial latent from MacroNet, Fourier
-features of ω, and log(ε), so it can learn to suppress corrections in the
-diffusion regime.
+**Loss** = intensity L2 + moment consistency (quadrature moments of predicted I must agree with MacroNet's direct φ, J predictions) + ε-weighted diffusion regularization (extra gradient signal when ε is small).
 
-### Why this is theoretically sound
-
-1. **The diffusion limit is exact by construction.** As ε → 0, I → φ/(4π)
-   and R → 0. MacroNet only needs to learn the diffusion equation (a scalar
-   elliptic PDE — much simpler). The network does not have to discover the
-   diffusion limit from data.
-
-2. **The network learns only the non-trivial part.** R is precisely the
-   transport correction that cannot be expressed by a moment closure. In
-   optically thick regions R ≈ 0 and the model is effectively a diffusion
-   solver. In transport-dominated regions R carries the full angular structure.
-
-3. **Moment consistency is enforced by an explicit loss term.** The quadrature
-   moments of the predicted I are penalised for disagreeing with MacroNet's
-   direct φ, J predictions, coupling the two sub-networks.
-
-4. **The ε-weighted diffusion loss** provides extra gradient signal toward the
-   diffusion limit when ε is small — the regime where data is hardest to
-   generate and training is most unstable.
-
-This design is inspired by the micro-macro decomposition of
-[[Lemou & Mieussens 2008](#asymptotic-preserving-methods-ap--apnn)] and
-the APNN framework of
-[[Jin & Ma 2022](#asymptotic-preserving-methods-ap--apnn)], but differs
-in two key ways: (a) it is an **operator learning** model (inputs are entire
-coefficient fields, not coordinates), and (b) the AP property is enforced at
-the **architecture level** rather than purely through a loss residual.
-The closest published precedent for the radiative transfer setting is
-[[Li et al. 2022](#asymptotic-preserving-methods-ap--apnn)] (MD-APNN for
-gray radiative transfer equations), which uses the same micro-macro split but
-as a PINN solving a single fixed instance rather than learning an operator.
-
-### Known limitations
-
-- **Missing ε normalisation.** The literature defines the micro variable as
-  `g = (I − ρ)/ε` so it stays O(1) as ε → 0. This model uses `R = I − I_P1`
-  without the ε denominator, so R shrinks toward zero in the diffusion regime
-  and the MicroNet receives diminishing gradient signal there.
-- **MacroNet is grid-tied.** The FNO backbone requires a fixed spatial
-  resolution, so the macro part does not transfer across resolutions out of the
-  box (MicroNet does, being a pure MLP queried at arbitrary points).
-- **P1 is a poor starting point in voids.** In the Kobayashi void-duct problems
-  the solution is highly anisotropic and P1 reconstruction can be negative in
-  some directions, placing a larger burden on R.
+The diffusion limit is **exact by construction**: as ε → 0, R → 0 and the model reduces to a diffusion solver. MacroNet only needs to learn the diffusion equation rather than discovering the limit from data. This design follows the micro-macro decomposition of Lemou & Mieussens (2008) and the APNN framework of Jin & Ma (2022), extended from single-instance PINNs to full operator learning over coefficient fields.
 
 ---
 
-## What is Real, What is Approximate, and What is Synthetic
+## Baseline Models
 
-### Summary
+### FNO — Fourier Neural Operator
 
-| Component | Status | Details |
-|---|---|---|
-| Cross sections | ✅ **Real** | Digit-for-digit from published benchmark reports |
-| Geometry / material layout | ✅ **Real** | Exact pin lattices, duct shapes, disk profiles |
-| Kinetics parameters (C5G7-TD) | ✅ **Real** | Published β_i, λ_i from NEA/NSC/DOC(2016)7 |
-| Flux / intensity targets | ⚠️ **Approximate** | Physics-based but not reference SN/MC solutions |
-| Training datasets | ⚠️ **Synthetically generated** | Produced by `generate_dataset.py` on your machine |
-| Reference benchmark data | ❌ **Not included** | Must be obtained from OECD/NEA or run a solver |
+FFT-based spectral convolution on the spatial grid, lifted with Fourier positional features. An angular query head evaluates at arbitrary ω directions. Moments φ, J are computed by quadrature over predicted intensity. Implemented in [`src/models/fno.py`](src/models/fno.py).
 
-### The datasets are synthetically generated — not from official codes
+### DeepONet
 
-When you run `generate_dataset.py` or `run_all.py`, the training data is
-**computed on your machine** using internal approximations — no external
-solver is invoked and no official benchmark data is downloaded. The datasets
-in `runs/datasets/` are synthetic in the sense that:
+- **Branch net**: CNN encoding input fields (σ_a, σ_s, q) into a latent vector
+- **Trunk net**: MLP encoding query points (x, ω) with Fourier features
+- Combined via dot product; supports variable-size angular sets at evaluation time
 
-- They are not the official OECD/NEA reference solutions
-- They are not output from a validated SN or Monte Carlo code
-- Each call to `generate_dataset.py` produces a fresh set of samples with
-  ±3% random XS perturbations for diversity
-
-This is intentional for the current development stage: the pipeline runs
-end-to-end without any external dependencies, and the physically-consistent
-approximations are sufficient to test model architecture and training
-stability. For publication-quality results, replace with solver-generated
-targets (see [Getting Real Flux Targets](#getting-real-flux-targets)).
-
-### What is real in the inputs
-
-| Benchmark | What is real |
-|---|---|
-| **C5G7** | Published 7-group XS for all 6 materials (UO2, MOX4.3/7.0/8.7, guide tube, fission chamber, moderator); full 51×51 quarter-core geometry (3×3 assemblies × 17×17 pin lattice). Source: NEA/NSC/DOC(2003)16, Table 2. |
-| **C5G7-TD** | Same XS as C5G7 + published 6-group delayed-neutron parameters (β_total=0.006502, λ_i) from NEA/NSC/DOC(2016)7; rod-ejection transient solved with RK4 point kinetics |
-| **Kobayashi** | Exact published geometry (L-shaped duct, dogleg, dog-ear) and σ_t values (source=0.1, void=1e-8, absorber=10.0 cm⁻¹). Source: NSC-DOC(2000)4. |
-| **Pinte 2009** | Published disk density law (Σ ∝ r⁻¹, flared H ∝ r^1.25), stellar parameters (T_eff=9500 K, L=47 L_sun), dust opacity from Mie theory (κ_abs=2.3, κ_sca=10.4 cm²/g, g=0.60). Source: Pinte et al. 2009, Table 1. |
-
-### What is approximate in the targets
-
-| Benchmark | Current flux/intensity target | Accuracy | Real target requires |
-|---|---|---|---|
-| **C5G7** | Multigroup diffusion: −D∇²φ + σ_a φ = S | Good in optically thick regions; wrong in voids | OpenMC MC or OpenSn SN |
-| **C5G7-TD** | Point kinetics α(t) × steady-state shape φ_ss(x) | Good for slow transients; wrong when spatial shape changes | Time-dependent SN solver |
-| **Kobayashi** | First-flight transport kernel | Exact in void; misses scatter in source region | Full SN or MC |
-| **Pinte 2009** | 5-step Λ-iteration radiative transfer | Accurate for τ < few; underestimates thick-disk scattering | MCFOST or RADMC-3D |
-
-**The OpenMC model for C5G7 is fully implemented** (`src/solvers/openmc_c5g7_model.py`)
-and produces real Monte Carlo flux once the `openmc` binary is installed via conda.
-See [Pending Work](#pending-work) below.
+Implemented in [`src/models/deeponet.py`](src/models/deeponet.py).
 
 ---
 
-## Pending Work
+## Benchmarks
 
-> **These are the remaining steps before this repository can produce
-> publication-quality results.** Tasks 1–5 replace the current synthetic
-> approximations with data from official OECD/NEA benchmark documents and
-> validated solvers. Task 6 implements the rational activation experiments
-> that are the primary research contribution.
+### C5G7 — 2D Nuclear Criticality Eigenvalue
 
-### Task 1 — Download the official OECD/NEA benchmark documents
+The OECD/NEA C5G7 benchmark: a 2D quarter-core PWR with 6 materials (UO2, MOX 4.3/7.0/8.7%, guide tube, fission chamber, moderator) on a 51×51 spatial grid, 7 neutron energy groups.
 
-These PDFs contain the authoritative cross sections, geometry tables, and
-**reference flux solutions** (the numbers your model should eventually match).
-All are free to download from the OECD Nuclear Energy Agency:
+**Ground truth**: real OpenMC Monte Carlo eigenvalue flux (5 M active particle histories per sample, ~0.7% flux uncertainty). Each sample runs a fully independent OpenMC simulation with its own perturbed cross-section library.
 
-| Benchmark | Document ID | Direct download URL |
+**What varies per sample** (out of T : (σ_a, σ_s, q, BC, ε, g) → I):
+
+| Input | Status | Detail |
 |---|---|---|
-| **C5G7** | NEA/NSC/DOC(2003)16 | https://www.oecd-nea.org/upload/docs/application/pdf/2019-12/nsc-doc2003-16.pdf |
-| **C5G7-TD** | NEA/NSC/DOC(2016)7 | https://www.oecd-nea.org/upload/docs/application/pdf/2020-01/nsc-doc2016-7.pdf |
-| **Kobayashi** | NSC/DOC(2000)4 | https://www.oecd-nea.org/upload/docs/application/pdf/2020-01/nsc-doc2000-4.pdf |
+| σ_a (absorption) | ✅ **Varies** | ×U[0.9, 1.1] independently per material per energy group (7 materials × 7 groups = 49 independent scalars) |
+| σ_s (scattering) | ✅ **Varies** | ×U[0.9, 1.1] independently per material per group, drawn independently of σ_a |
+| q / ν·σ_f (fission source) | ✅ **Varies** | ×U[0.9, 1.1] per material per group (eigenvalue problem — fission source is derived from ν·σ_f, not an independent q) |
+| BC | ❌ **Fixed** | Vacuum (zero incoming flux) on all four sides — fixed by the C5G7 benchmark definition |
+| ε | ❌ **Not physical** | Stored as a model-input label but **does not affect the OpenMC simulation**. Physics is identical across all ε labels. Regime sweep is therefore skipped for C5G7. |
+| g (anisotropy) | ❌ **Fixed** | 0 (isotropic scattering) — fixed by the C5G7 benchmark definition |
+| Geometry | ❌ **Fixed** | 51×51 quarter-core pin layout — fixed by the C5G7 benchmark definition |
 
-Download all three PDFs and keep them for reference. The cross sections already
-hardcoded in this repository were taken from these documents. What is still
-missing is the **reference flux distribution** printed in the appendices —
-that is the ground truth your trained model should converge to.
+The ±10% XS perturbation (`--xs_perturb 0.10`) produces meaningfully distinct flux shapes: the C5G7 flux is sensitive to material composition, so k-eff and the spatial flux distribution both change substantially across samples.
 
-For **Pinte 2009**, the reference intensity maps are attached as FITS files to
-the original paper:
-- **Paper**: Pinte et al. 2009, A&A 498, 967–980 — https://doi.org/10.1051/0004-6361/200811474
-- **Benchmark data** (FITS intensity maps): contact the authors or download
-  from the journal supplementary material page.
+### Pinte 2009 — 2D Protoplanetary Disk Radiative Transfer
 
-### Task 2 — Replace C5G7 flux targets with OpenMC Monte Carlo output
+The Pinte et al. (2009) benchmark: a 2D axisymmetric protoplanetary disk with dust scattering, on a 32×32 spatial grid, 1 wavelength group.
 
-The code for this is **already written** — you just need the `openmc` binary.
+**Ground truth**: currently a 5-step Λ-iteration approximation with P1 angular reconstruction. Real targets require MCFOST or RADMC-3D (see [Pending Work](#pending-work)).
 
-```bash
-# Step 1 — Install OpenMC with its compiled binary via conda
-#           (pip alone installs only the Python API, not the transport solver)
-conda create -n openmc_env python=3.11
-conda activate openmc_env
-conda install -c conda-forge openmc
+**What varies per sample** (out of T : (σ_a, σ_s, q, BC, ε, g) → I):
 
-# Step 2 — Also install Python deps in this env
-pip install torch numpy h5py tqdm scipy einops tensorboard
+| Input | Status | Detail |
+|---|---|---|
+| σ_a (absorption) | ✅ **Varies** | κ_abs ×U[0.9, 1.1] → σ_a = κ_abs · ρ(x) |
+| σ_s (scattering) | ✅ **Varies** | κ_sca ×U[0.9, 1.1] → σ_s = κ_sca · ρ(x) |
+| q (stellar heating) | ✅ **Varies** | proportional to B_lam (the stellar boundary condition) |
+| BC | ✅ **Varies** | B_lam ×U[0.8, 1.2] — stellar irradiation inflow driving the entire RT problem |
+| ε | ✅ **Varies** | U[ε_min, ε_max] per sample — physically meaningful, governs optical depth / scattering regime |
+| g (anisotropy) | ✅ **Varies** | Henyey-Greenstein g ×U[0.9, 1.1], clipped to [0, 0.99] |
+| Geometry | ✅ **Varies** | R_in ×U[0.7, 1.3], flaring index ξ ×U[0.8, 1.2], scale height H₀ ×U[0.7, 1.3] |
 
-# Step 3 — Smoke test: runs a small C5G7 eigenvalue calculation
-cd "C:\Users\Maosen\2026 Neurips"
-python scripts/run_openmc_c5g7.py \
-    --n_particles 5000 --n_batches 20 --n_inactive 5 --n_samples 5
-
-# Verify: k-effective printed to console should be ≈ 1.185
-# Published OECD reference: k_eff = 1.18655 ± 0.00033
-
-# Step 4 — Full production run (generate real MC training data)
-python scripts/run_openmc_c5g7.py \
-    --splits train val test \
-    --n_samples 200 50 50 \
-    --n_particles 500000 --n_batches 500 --n_inactive 100
-```
-
-Output: `runs/datasets/c5g7_train.zarr.h5` etc. with real Monte Carlo scalar
-flux. The rest of the pipeline (`train.py`, `eval.py`, `run_all.py`) is
-unchanged — just re-run from Step 2 of Quick Start, skipping `generate_dataset.py`
-for `c5g7`.
-
-### Task 3 — Replace Kobayashi flux targets with a reference SN solver
-
-**OpenSn** (formerly OpenSN / Delphi) is a free, open-source SN solver:
-- Homepage: https://github.com/Open-Sn/opensn
-- Runs natively on **Linux/macOS**; on Windows use **WSL2** (Windows Subsystem
-  for Linux).
-
-```bash
-# WSL2 install (Windows) — one-time setup
-wsl --install          # then restart, set up Ubuntu in WSL2
-
-# Inside WSL2
-sudo apt update && sudo apt install -y cmake python3-dev python3-pip git
-git clone https://github.com/Open-Sn/opensn.git
-cd opensn && mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release && make -j4
-# Follow opensn docs for Python bindings
-```
-
-The interface stub is in `src/solvers/opensn_interface.py` — it already knows
-how to call OpenSn and parse its flux output. Once OpenSn is installed, set the
-`solver` field in `configs/benchmarks/kobayashi.yaml` to `opensn` and
-re-run `generate_dataset.py`.
-
-### Task 4 — Replace Pinte 2009 intensity with MCFOST or RADMC-3D output
-
-- **MCFOST**: https://mcfost.readthedocs.io — Monte Carlo radiative transfer for
-  protoplanetary disks. The exact disk model from Pinte et al. 2009 was run with
-  MCFOST; config files are in the paper's supplementary material.
-- **RADMC-3D**: https://www.ita.uni-heidelberg.de/~dullemond/software/radmc-3d/ —
-  alternative RT solver, widely used.
-
-After running either solver, convert its output using
-`scripts/convert_pinte2009.py` (adapt the flux-loading section) and save with
-`scripts/generate_dataset.py --benchmark pinte2009`.
-
-### Task 5 — Replace C5G7-TD flux targets with a time-dependent SN solution
-
-Currently the time-dependent target is `α(t) × φ_ss(x)` from point kinetics,
-which assumes the spatial flux shape does not change during the transient.
-A proper target requires a full space-time SN solve.
-
-- **OpenSn** supports time-dependent transport (see its documentation).
-- The converter in `src/data/converters/c5g7_td.py` is ready to accept
-  externally provided flux snapshots; replace the `point_kinetics` section
-  with loader code once solver output is available.
-
-### Task 6 — Integrate trainable rational activations across all models
-
-**Library**: [`rational_activations`](https://github.com/ml-research/rational_activations),
-PyTorch API: `from rational.torch import Rational`.
-
-The scientific question is whether replacing fixed nonlinearities (ReLU/GELU/SiLU)
-with trainable rational functions improves **cross-regime, cross-resolution, and
-SN-transfer generalization**. This requires changes across config, models, trainer,
-evaluation scripts, and tests.
-
-#### A — Feature flags and config
-
-Add a unified activation configuration block used by all three models:
-
-- `model.activation.name`: one of `["relu", "gelu", "silu", "rational"]`
-- `model.activation.rational`: dict with keys `approx_func` (default `"leaky_relu"`),
-  `degrees` (default `[5,4]`), `version` (default `"A"`), `trainable` (default `true`),
-  `train_numerator` (default `true`), `train_denominator` (default `true`),
-  `share_policy` (one of `"none"` / `"global"` / `"per_block"`),
-  `capture_every_epochs` (default `0`), `capture_x_range` (default `[-5,5]`),
-  `capture_num_points` (default `512`), `export_graphs` (default `false`),
-  `export_dir` (default `"runs/<run_id>/rational_graphs"`)
-
-Add optimizer config for rational parameters:
-
-- `optim.rational_lr_mult` (default `1.0`) — multiplier applied to the base LR for rational params
-- `optim.rational_weight_decay` (default same as base) — separate weight decay for rational params
-
-Add three new Hydra config files that inherit from the baseline model configs and
-only override the activation block:
-
-- `configs/model/fno_rational.yaml`
-- `configs/model/deeponet_rational.yaml`
-- `configs/model/ap_micromacro_rational.yaml`
-
-#### B — Activation factory in `src/models/common.py`
-
-Add an `ActivationFactory` class that:
-
-- Returns `nn.ReLU` / `nn.GELU` / `nn.SiLU` for standard activations.
-- Imports `Rational` from `rational.torch` (with a clear `ImportError` if absent)
-  and instantiates it with the config args for rational activations.
-- Implements the three sharing policies via an internal registry:
-  - `"global"` — one shared `Rational` instance reused everywhere
-  - `"per_block"` — one instance per `block_id` key
-  - `"none"` — a fresh instance at every call
-- Provides helper functions `is_rational_module(m)` and `iter_rational_modules(model)`.
-- Provides a curve-sampling helper that evaluates `y = rational(x)` over
-  `capture_x_range` and returns `(x, y)` on CPU for TensorBoard logging or
-  optional SVG/PNG export (guarded with `try/except ImportError` for matplotlib).
-
-#### C — Update all three models to use the factory
-
-Every hard-coded nonlinearity inside `src/models/fno.py`, `src/models/deeponet.py`,
-and `src/models/ap_micromacro.py` must be constructed through `ActivationFactory`.
-Use consistent `block_id` strings (e.g., `"fno_block_0"`, `"deeponet_branch"`,
-`"ap_macro"`, `"ap_micro"`) so the sharing policy is deterministic. Forward
-signatures and output semantics are unchanged.
-
-#### D — Trainer updates in `src/trainers/trainer.py`
-
-Split optimizer param groups:
-
-- `base_params` — all parameters not belonging to `Rational` modules
-- `rational_params` — parameters of `Rational` modules (numerator and denominator)
-  with `lr = base_lr * rational_lr_mult` and `weight_decay = rational_weight_decay`
-
-Ensure there is zero parameter overlap between groups.
-
-Add rational logging:
-
-- At training start: log number of `Rational` modules, their degrees/version, and
-  numerator/denominator parameter counts.
-- Every `capture_every_epochs` epochs (if > 0): sample each rational module's curve
-  and log to TensorBoard; optionally export graphs to `export_dir`.
-- Extend the existing NaN/Inf check to report whether NaNs originate from rational
-  module outputs.
-
-#### E — Evaluation: no logic changes
-
-Checkpoint loading must work with `Rational` modules (they are standard `nn.Module`
-subclasses, so `torch.load` / `model.load_state_dict` requires no changes). Metrics
-and protocol logic are unchanged.
-
-#### F — Run scripts: rational ablation table
-
-Extend `run_all.py` (or add `scripts/run_with_rational.sh`) to run, for each
-benchmark and each model family, a paired comparison:
-
-- Standard activation run (e.g., SiLU baseline)
-- Rational activation run (identical except activation config)
-
-Each run executes smoke train → eval → SN-transfer → resolution-transfer →
-ε-sweep. Aggregate all results into `runs/aggregate.csv` with columns:
-`benchmark, model, activation, seed, train_res, test_res, train_Nw, test_Nw,
-epsilon, sn_transfer_rel_l2, resolution_transfer_rel_l2, regime_sweep_rel_l2`.
-
-Add optional config presets for degree/version ablations:
-
-- Degrees `(3,2)` and `(7,6)` as alternatives to the default `(5,4)`
-- Version `"B"` as an alternative to `"A"`
-
-#### G — Tests
-
-Add tests to `tests/` that verify:
-
-- `ActivationFactory` returns a `Rational` module when configured with
-  `name="rational"`, and a standard `nn.Module` otherwise.
-- Forward pass succeeds for all three models with rational activation and
-  variable-size ω batches (the discretization-agnostic case).
-- Optimizer param groups contain no parameter overlap and rational params are
-  routed to the correct group.
-
-#### Commands (to add to README after implementation)
-
-```bash
-# Train AP Micro-Macro with rational activations on C5G7
-python train.py --benchmark c5g7 --model ap_micromacro \
-    model.activation.name=rational
-
-# Train FNO with rational activations
-python train.py --benchmark c5g7 --model fno \
-    model.activation.name=rational \
-    optim.rational_lr_mult=2.0
-
-# Full rational-vs-standard ablation (all benchmarks, all models)
-python run_all.py --activation silu rational
-
-# Degree sweep
-python sweep.py --benchmark c5g7 --model ap_micromacro \
-    model.activation.name=rational \
-    "model.activation.rational.degrees=[3,2],[5,4],[7,6]"
-```
+Pinte 2009 has the richest per-sample diversity: all six inputs of T vary, including geometry and BC.
 
 ---
 
 ## Quick Start
 
-> **Note on data:** `generate_dataset.py` creates **synthetic training data on your
-> machine** using built-in physics approximations. It does NOT download official
-> benchmark data or call an external solver. The resulting `runs/datasets/` files are
-> sufficient to develop and test model architectures but are **not** official reference
-> solutions. See [Pending Work](#pending-work)
-> for instructions on obtaining the real OECD/NEA data and running validated solvers.
+### Requirements
+
+- Python 3.9+, PyTorch 2.0+ (CUDA recommended)
+- `pip install -r requirements.txt`
+- **OpenMC** for real C5G7 targets: `conda install -c conda-forge openmc`
+  (without it, a mock analytic fallback is used and a WARNING is logged)
+
+### One-shot run
 
 ```bash
-# 1. Install Python dependencies
+git clone https://github.com/your-org/rational-ap-transport-operator
+cd rational-ap-transport-operator
 pip install -r requirements.txt
 
-# 2. Generate synthetic datasets (diffusion/first-flight approx — no external solver needed)
-python scripts/generate_dataset.py --benchmark c5g7      --n_samples 200 --split train
-python scripts/generate_dataset.py --benchmark c5g7      --n_samples 50  --split val
-python scripts/generate_dataset.py --benchmark kobayashi --n_samples 100 --split train
-python scripts/generate_dataset.py --benchmark pinte2009 --n_samples 150 --split train
-
-# 3. Train one model
-python train.py --benchmark c5g7 --model ap_micromacro --n_epochs 100
-
-# 4. Evaluate
-python eval.py --checkpoint runs/c5g7_ap_micromacro_seed42/checkpoints/best.pt \
-               --protocol all
-
-# 5. Run everything in one shot (generate → train all models → eval → aggregate CSV)
-python run_all.py --quick          # smoke test, ~3 min
-python run_all.py                  # full run, ~1-4h depending on GPU
-
-# 6. Hyperparameter sweep
-python sweep.py --benchmark c5g7 --model ap_micromacro --seeds 1 2 3
+python run_all.py --quick          # smoke test, ~5 min
+python run_all.py                  # full run, both benchmarks × 3 models
+python run_all.py --benchmark c5g7 --model ap_micromacro  # single combo
 ```
 
----
+`run_all.py` runs the complete pipeline: generate → train → evaluate → aggregate. All outputs land in `runs/`.
 
-## One-Shot Pipeline: `run_all.py`
+### Step-by-step
 
-`run_all.py` automates the entire research pipeline end-to-end:
-
-```
-generate data → train (FNO, DeepONet, AP Micro-Macro) → evaluate (3 protocols) → aggregate CSV
-```
+**1. Generate datasets**
 
 ```bash
-# Smoke test — ~3 minutes, 20 training samples, 3 epochs
-python run_all.py --quick
-
-# Single benchmark + model
-python run_all.py --benchmark c5g7 --model ap_micromacro
-
-# Multiple benchmarks
-python run_all.py --benchmark c5g7 kobayashi --model fno ap_micromacro
-
-# Custom scale
-python run_all.py --epochs 200 --n_train 500 --n_val 100
-
-# Skip re-generating data (use existing runs/datasets/)
-python run_all.py --skip_generate
-
-# Skip training (use existing checkpoints)
-python run_all.py --skip_train
+python scripts/generate_dataset.py --benchmark c5g7 --split train --n_samples 200
+python scripts/generate_dataset.py --benchmark c5g7 --split val   --n_samples 50
+# test + resolution_x2/x4 in one call:
+python scripts/generate_dataset.py --benchmark c5g7 --split all_eval --n_samples 50
 ```
 
-**Outputs** after a full run:
+Add `--n_batches 300` for full publication-quality OpenMC accuracy (~85 s/sample vs ~17 s default).
 
-```
-runs/aggregate/all_results.csv              ← THE paper table
-runs/eval/<benchmark>_<model>/
-    sn_transfer.csv
-    resolution_transfer.csv
-    regime_sweep.csv
-runs/<benchmark>_<model>/checkpoints/best.pt
+**2. Train**
+
+```bash
+python train.py --benchmark c5g7 --model ap_micromacro \
+    --n_epochs 100 --data_dir runs/datasets
 ```
 
-The terminal prints a summary table:
+**3. Evaluate**
 
+```bash
+python eval.py \
+    --checkpoint runs/c5g7_ap_micromacro/checkpoints/best.pt \
+    --benchmark c5g7 --model ap_micromacro \
+    --protocol all --data_dir runs/datasets
 ```
-Benchmark              Model              sn_transfer    resolution_transfer  regime_sweep
-c5g7                   ap_micromacro      0.0412         0.0631               0.0887
-c5g7                   fno                0.0589         0.0714               0.1203
-...
-```
-
----
-
----
-
-## Models
-
-### FNO — Fourier Neural Operator
-FFT-based spectral convolution on the uniform spatial grid, lifted with Fourier
-positional features. An angular query head evaluates at arbitrary ω directions
-(discretization-agnostic). Moments φ, J are computed by quadrature over the
-predicted intensity.
-
-### DeepONet
-- **Branch net**: CNN that encodes the input fields (σ_a, σ_s, q) into a latent vector
-- **Trunk net**: MLP that encodes query points (x, ω, t) with Fourier features
-- Combines via dot product; supports variable-size angular sets at evaluation time
-
-### AP Micro-Macro *(recommended baseline)*
-Explicitly decomposes intensity into macro and micro parts:
-
-```
-Macro net  →  φ(x), J(x)            (FNO-based, grid quantities)
-I_P1(x,ω)  =  φ/(4π) + (3/4π) J·ω  (deterministic P1 closure)
-Micro net  →  R(x, ω)               (residual, angular query head)
-I(x, ω)    =  I_P1(x, ω) + R(x, ω)
-```
-
-Loss = intensity L2 + moment consistency + diffusion-limit regularization (ε-weighted).
-This model is consistent with the diffusion limit by construction.
 
 ---
 
 ## Evaluation Protocols
 
-| Protocol | What it tests | Key metric |
+| Protocol | What it tests | Benchmarks |
 |---|---|---|
-| **SN Transfer** | Train S8, test S4/S16/S32/S64 | I_rel_l2 vs N_ω |
-| **Resolution Transfer** | Train 17×17, test 34×34, 68×68 | I_rel_l2 vs multiplier |
-| **Regime Sweep** | ε from 0.001 to 5.0 | I_rel_l2 vs ε |
+| `test_set` | Held-out test split at training resolution | Both |
+| `sn_transfer` | Generalization to unseen SN orders (S4 → S64) | Both |
+| `resolution_transfer` | Generalization to 2×/4× finer spatial grids (bilinear-interpolated targets) | Both |
+| `regime_sweep` | Generalization across ε ∈ [0.001, 5.0] | Pinte 2009 only |
+
+All protocols read entirely from pre-generated disk splits — no solver is invoked during evaluation. Pass `--split all_eval` to `generate_dataset.py` to produce all evaluation splits upfront.
 
 ---
 
-## Benchmark Tasks
+## Pending Work
 
-| Benchmark | Type | Groups | Dim | XS source | Flux source |
-|---|---|---|---|---|---|
-| `c5g7` | Steady eigenvalue | 7 | 2D | NEA/NSC/DOC(2003)16, Table 2 | Diffusion approx / OpenMC |
-| `c5g7_td` | Time-dependent | 7 | 2D | Same + delayed-n kinetics | Point kinetics × SS shape |
-| `kobayashi` | Fixed source, void | 1 | 3D | NSC-DOC(2000)4 | First-flight kernel |
-| `pinte2009` | Radiative transfer | 1 | 2D | Pinte et al. 2009, Table 1 | 5-step Λ-iteration |
+### Task 1 — Real flux targets for Pinte 2009
+
+Integrate MCFOST or RADMC-3D:
+- **MCFOST**: https://mcfost.readthedocs.io
+- **RADMC-3D**: https://www.ita.uni-heidelberg.de/~dullemond/software/radmc-3d/
+
+After running, convert output with [`scripts/convert_pinte2009.py`](scripts/convert_pinte2009.py) and register the solver in `_BENCHMARK_SOLVER_PREFERENCE["pinte2009"]` in [`src/solvers/__init__.py`](src/solvers/__init__.py).
+
+### Task 2 — Trainable rational activations
+
+Integrate [`rational_activations`](https://github.com/ml-research/rational_activations) (`from rational.torch import Rational`) across all three models:
+
+- **Config**: add `model.activation.name` (`relu`/`gelu`/`silu`/`rational`) and rational hyperparams (degree, sharing policy) to model configs
+- **`src/models/common.py`**: add `ActivationFactory` returning standard or `Rational` modules
+- **All three models**: replace hard-coded nonlinearities with `ActivationFactory` calls
+- **`src/trainers/trainer.py`**: split optimizer into `base_params` and `rational_params` groups with separate LR/weight-decay
+- **`run_all.py`**: add paired ablation (standard vs rational) for each benchmark × model
+- **Tests**: verify forward pass, optimizer param groups, and `ActivationFactory` dispatch
 
 ---
 
-## File Tree
+## Repository Structure
 
 ```
-src/
-  data/
-    schema.py              Canonical dataclasses (InputFields, QueryPoints, TargetFields)
-    dataset.py             PyTorch Dataset + collate_fn (variable-Nω padding)
-    io.py                  HDF5 writer/reader (h5py on Windows, zarr on Linux/macOS)
-    converters/
-      c5g7.py              Quarter-core geometry, 6 materials, diffusion flux
-      c5g7_td.py           Rod-ejection transient, 6-group point kinetics
-      kobayashi.py         L-shaped/dogleg void duct, first-flight flux
-      pinte2009.py         Protoplanetary disk, Λ-iteration intensity
-  models/
-    common.py              FourierFeatures, SphericalFourierFeatures, MLP, SpectralConv
-    fno.py                 FNO with angular query head
-    deeponet.py            DeepONet (branch + trunk)
-    ap_micromacro.py       AP Micro-Macro (P1 + residual)
-  trainers/
-    trainer.py             Training loop: AMP, EMA, grad clipping, TensorBoard, checkpointing
-  eval/
-    metrics.py             l2_error, relative_l2, moment errors, energy balance
-    protocols.py           SNTransferProtocol, ResolutionTransferProtocol, RegimeSweepProtocol
-  solvers/
-    openmc_c5g7_model.py   ★ Full C5G7 OpenMC model (real MC, needs conda binary)
-    openmc_interface.py    OpenMC interface + diffusion fallback
-    opensn_interface.py    OpenSn stub (real API calls ready, needs OpenSn installed)
-    mock_backend.py        Diffusion/P1 approximation backend
-  utils/
-    seed.py                Deterministic seeding (CUDA-safe)
-    io_utils.py            save_json / save_csv (robust to variable column sets)
-    logging_utils.py       Logging setup
-    config.py              Hydra config dataclasses
-configs/
-  benchmarks/
-    c5g7.yaml              spatial_shape=[51,51], n_groups=7
-    c5g7_td.yaml           time_dependent=true, n_time=20
-    kobayashi.yaml         spatial_shape=[20,20,20], problem=1
-    pinte2009.yaml         wavelength_um=1.0
-  models/
-    fno.yaml
-    deeponet.yaml
-    ap_micromacro.yaml
-  train.yaml
-  eval.yaml
-scripts/
-  generate_dataset.py      Generate any benchmark dataset
-  run_openmc_c5g7.py       ★ Run OpenMC → generate real MC flux dataset
-  convert_c5g7.py          Standalone C5G7 converter
-  convert_c5g7_td.py
-  convert_kobayashi_void.py
-  convert_pinte2009.py
-  inspect_dataset.py       Print dataset statistics, optionally plot
-  run_baselines.sh         Legacy bash smoke test
-tests/
-  test_schema.py
-  test_models.py
-  test_dataset.py
-  test_metrics.py
-  test_trainer.py
-train.py                   Main training CLI
-eval.py                    Main evaluation CLI
-sweep.py                   Hyperparameter grid sweep
-run_all.py                 ★ One-shot pipeline: generate → train → eval → aggregate
-requirements.txt
+rational-ap-transport-operator/
+├── train.py              Training CLI
+├── eval.py               Evaluation CLI (4 protocols)
+├── sweep.py              Hyperparameter grid sweep
+├── run_all.py            One-shot pipeline: generate → train → eval → aggregate
+├── requirements.txt
+├── configs/
+│   ├── benchmarks/       c5g7.yaml, pinte2009.yaml
+│   └── models/           fno.yaml, deeponet.yaml, ap_micromacro.yaml
+├── scripts/
+│   ├── generate_dataset.py
+│   ├── run_openmc_c5g7.py
+│   ├── convert_c5g7.py
+│   ├── convert_pinte2009.py
+│   └── inspect_dataset.py
+├── src/
+│   ├── data/             schema.py, dataset.py, io.py, converters/
+│   ├── models/           fno.py, deeponet.py, ap_micromacro.py, common.py
+│   ├── trainers/         trainer.py
+│   ├── eval/             metrics.py, protocols.py
+│   ├── solvers/          openmc_interface.py, mock_backend.py
+│   └── utils/            config.py, logging_utils.py, seed.py, io_utils.py
+└── tests/
 ```
 
 ---
 
-## Data Schema
-
-Every sample is a `TransportSample` with three parts:
-
-```python
-sample.inputs   # InputFields:  sigma_a [nx,ny,G], sigma_s, q, BCSpec, params, metadata
-sample.query    # QueryPoints:  x [Nx,d], omega [Nω,d], w_omega [Nω], t (optional)
-sample.targets  # TargetFields: I [Nx,Nω,G], phi [Nx,G], J [Nx,d,G], qois dict
-```
-
-`collate_fn` in `dataset.py` handles variable `Nω` across samples by padding and
-returning an `omega_mask`.
-
-Storage: h5py HDF5 on Windows (no atomic-rename issues), zarr on Linux/macOS.
-
----
-
-## Configuration
-
-Uses [Hydra](https://hydra.cc/) for config composition. Quick override examples:
-
-```bash
-python train.py benchmark=c5g7 model=fno trainer.lr=5e-4 trainer.n_epochs=50
-python eval.py  benchmark=c5g7 model=ap_micromacro eval.protocol=regime_sweep
-```
-
----
-
-## Running Tests
+## Tests
 
 ```bash
 pytest tests/ -v
@@ -690,131 +251,19 @@ pytest tests/ -v
 
 ## Citations
 
-If you use this codebase, please cite the relevant benchmarks, methods, and
-tools. Brief explanations are included so it is clear why each reference matters.
+**Benchmarks**
+- OECD/NEA. *Benchmark on Deterministic Transport Calculations Without Spatial Homogenisation.* NEA/NSC/DOC(2003)16. (C5G7)
+- Pinte et al. *Benchmark problems for continuum radiative transfer.* A&A 498, 967–980 (2009). https://doi.org/10.1051/0004-6361/200811474
 
----
+**Neural operators**
+- Li et al. *Fourier Neural Operator for Parametric PDEs.* ICLR 2021. https://arxiv.org/abs/2010.08895
+- Lu et al. *Learning Nonlinear Operators via DeepONet.* Nature MI 3, 218–229 (2021). https://doi.org/10.1038/s42256-021-00302-5
+- Kovachki et al. *Neural Operator: Learning Maps Between Function Spaces.* JMLR 24(89) (2023). https://arxiv.org/abs/2108.08481
 
-### Benchmark definitions and reference solutions
+**Asymptotic-preserving methods**
+- Jin & Ma. *Asymptotic-Preserving Neural Networks for Multiscale Kinetic Equations.* CiCP 31(5) (2022). https://doi.org/10.4208/cicp.OA-2021-0166
+- Lemou & Mieussens. *A New AP Scheme Based on Micro-Macro Formulation.* SIAM J. Sci. Comput. 31(1) (2008). https://doi.org/10.1137/07069479X
+- Jin. *Efficient AP Schemes for Multiscale Kinetic Equations.* SIAM J. Sci. Comput. 21(2) (1999). https://doi.org/10.1137/S1064827598334599
 
-- **C5G7 steady-state benchmark**
-  OECD/NEA. *Benchmark on Deterministic Transport Calculations Without Spatial
-  Homogenisation: A 2-D/3-D MOX Fuel Assembly Benchmark.* NEA/NSC/DOC(2003)16.
-  OECD, 2003.
-  → Defines the 7-group MOX quarter-core geometry, all six material cross
-  sections, and the published reference k-effective and flux distributions used
-  as ground truth in this work.
-
-- **C5G7-TD time-dependent benchmark**
-  OECD/NEA. *Deterministic Time-Dependent Neutron Transport Benchmark Without
-  Spatial Homogenisation.* NEA/NSC/DOC(2016)7. OECD, 2016.
-  → Extends C5G7 with rod-ejection transients; provides the 6-group
-  delayed-neutron parameters (β_i, λ_i) hardcoded in `src/data/converters/c5g7_td.py`.
-
-- **Kobayashi 3D void benchmark**
-  OECD/NEA. *3-D Radiation Transport Benchmark Problems and Solutions with
-  Void Region.* NSC/DOC(2000)4. OECD, 2000.
-  → Defines the three void-duct geometries (L-shaped, dogleg, dog-ear) and
-  the published σ_t values used in `src/data/converters/kobayashi.py`.
-
-- **Pinte et al. 2009 radiative transfer benchmark**
-  Pinte, C., Harries, T. J., Min, M., et al. *Benchmark problems for continuum
-  radiative transfer — High optical depths, anisotropic scattering, and polarisation.*
-  A&A 498, 967–980 (2009). https://doi.org/10.1051/0004-6361/200811474
-  → Provides the protoplanetary disk density law, stellar parameters, and
-  published intensity maps used as the Pinte 2009 benchmark target.
-
----
-
-### Neural operator architectures
-
-- **FNO — Fourier Neural Operator**
-  Li, Z., Kovachki, N., Azizzadenesheli, K., Liu, B., Bhattacharya, K.,
-  Stuart, A., Anandkumar, A. *Fourier Neural Operator for Parametric Partial
-  Differential Equations.* ICLR 2021. https://arxiv.org/abs/2010.08895
-  → The spectral convolution backbone used in `src/models/fno.py`. The key
-  property — learning in frequency space — makes FNO resolution-invariant in
-  principle, which is directly tested by the resolution-transfer protocol.
-
-- **DeepONet**
-  Lu, L., Jin, P., Pang, G., Zhang, Z., Karniadakis, G. E. *Learning Nonlinear
-  Operators via DeepONet Based on the Universal Approximation Theorem of Operators.*
-  Nature Machine Intelligence 3, 218–229 (2021). https://doi.org/10.1038/s42256-021-00302-5
-  → The branch-trunk factorisation used in `src/models/deeponet.py`. The
-  trunk net evaluates at arbitrary query points (x, ω), enabling
-  discretization-agnostic angular evaluation.
-
-- **Universal approximation for operators (theoretical basis for DeepONet)**
-  Chen, T., Chen, H. *Universal Approximation to Nonlinear Operators by Neural
-  Networks with Arbitrary Activation Functions and Its Application to Dynamical
-  Systems.* IEEE Trans. Neural Netw. 6(4), 911–917 (1995).
-  → Original theoretical result that operator learning with neural networks is
-  universal; motivates the DeepONet design.
-
-- **Neural operators (general framework)**
-  Kovachki, N., Li, Z., Liu, B., Azizzadenesheli, K., Bhattacharya, K.,
-  Stuart, A., Anandkumar, A. *Neural Operator: Learning Maps Between Function
-  Spaces With Applications to PDEs.* JMLR 24(89), 1–97 (2023).
-  https://arxiv.org/abs/2108.08481
-  → Unified framework for neural operators; provides the theoretical context
-  for evaluating FNO and DeepONet on transport problems.
-
----
-
-### Asymptotic-preserving methods (AP / APNN)
-
-- **AP neural network for multiscale kinetic equations (APNN)**
-  Jin, S., Ma, Z. *Asymptotic-Preserving Neural Networks for Multiscale Kinetic
-  Equations.* Communications in Computational Physics 31(5), 1497–1524 (2022).
-  https://doi.org/10.4208/cicp.OA-2021-0166
-  → Introduces the idea of building the diffusion limit directly into the
-  network architecture. The macro-micro decomposition `I = I_P1 + R` in
-  `src/models/ap_micromacro.py` is directly motivated by this work.
-
-- **AP schemes for radiative transfer (classical reference)**
-  Jin, S. *Efficient Asymptotic-Preserving (AP) Schemes for Some Multiscale
-  Kinetic Equations.* SIAM J. Sci. Comput. 21(2), 441–454 (1999).
-  https://doi.org/10.1137/S1064827598334599
-  → Original AP scheme paper; defines the ε-scaling and the requirement that
-  a numerical method recover the diffusion limit as ε → 0, which is the
-  property the AP Micro-Macro model satisfies by construction.
-
-- **Micro-macro decomposition for transport**
-  Lemou, M., Mieussens, L. *A New Asymptotic Preserving Scheme Based on
-  Micro-Macro Formulation for Linear Kinetic Equations in the Diffusion Limit.*
-  SIAM J. Sci. Comput. 31(1), 334–368 (2008).
-  https://doi.org/10.1137/07069479X
-  → Formal derivation of the micro-macro splitting that the AP Micro-Macro
-  model implements: the macroscopic (P1) part is solved exactly, and the
-  microscopic residual R is learned.
-
-- **P1 closure and diffusion approximation**
-  Pomraning, G. C. *The Equations of Radiation Hydrodynamics.* Pergamon Press,
-  1973. (Reprint: Dover, 2005.)
-  → Classic reference for the P1 angular approximation used in the deterministic
-  macro reconstruction `I_P1(x,ω) = φ/(4π) + (3/4π) J·ω`.
-
-- **APNN for the Boltzmann equation**
-  Jin, S., Ma, Z., Wu, K. *Asymptotic-Preserving Neural Networks for the
-  Boltzmann Equation.* Journal of Scientific Computing 97, 22 (2023).
-  https://doi.org/10.1007/s10915-023-02331-3
-  → Extends APNN to the full Boltzmann setting and studies convergence in the
-  diffusion limit; directly relevant to the regime-sweep evaluation protocol.
-
----
-
-### Reference solvers
-
-- **OpenMC Monte Carlo transport**
-  Romano, P. K., Horelik, N. E., Herman, B. R., Nelson, A. G., Forget, B.,
-  Smith, K. *OpenMC: A State-of-the-Art Monte Carlo Code for Research and
-  Development.* Ann. Nucl. Energy 82, 90–97 (2015).
-  https://doi.org/10.1016/j.anucene.2014.07.048
-  → The Monte Carlo solver used to generate real C5G7 flux targets via
-  `src/solvers/openmc_c5g7_model.py` once the binary is installed.
-
-- **OpenSn (formerly OpenSN/Chi-Tech) discrete ordinates solver**
-  Ragusa, J., et al. *OpenSn.* https://github.com/Open-Sn/opensn
-  → The SN solver interfaced in `src/solvers/opensn_interface.py`, intended
-  for generating reference Kobayashi and C5G7-TD flux solutions once installed
-  under WSL2/Linux.
+**Reference solver**
+- Romano et al. *OpenMC: A State-of-the-Art Monte Carlo Code.* Ann. Nucl. Energy 82, 90–97 (2015). https://doi.org/10.1016/j.anucene.2014.07.048

@@ -56,10 +56,17 @@ class MockSolver:
 
         I = self._reconstruct_intensity(phi, J, qry, inp, g)
 
+        # J stored = angular quadrature moment of I, consistent with model's J head.
+        # (J from _solve_* is the Fick law gradient, which differs from sum(w*omega*I)
+        #  by the P1 normalization factor; use the quadrature definition throughout.)
+        w_om = qry.w_omega   # [Nw]
+        omega = qry.omega    # [Nw, dim]
+        J_quad = np.einsum('w,wd,nwg->ndg', w_om, omega, I).astype(np.float32)
+
         new_targets = TargetFields(
             I=I.astype(np.float32),
             phi=phi.astype(np.float32),
-            J=J.astype(np.float32),
+            J=J_quad,
             qois=sample.targets.qois,
         )
 
@@ -136,12 +143,19 @@ class MockSolver:
         sigma_t = sigma_a_flat + sigma_s_flat
 
         # Uncollided flux: q / sigma_t
-        phi = q_flat / np.maximum(sigma_t, 1e-8)
+        # In void/near-void cells (sigma_t ≈ 0) with nonzero source the expression
+        # q/sigma_t diverges.  Physically, the flux in a void is set by streaming
+        # geometry, not by the local optical depth.  We regularise with a floor
+        # of 1/(domain_size) so that q/sigma_t ≤ q * L_domain (free-streaming).
+        x = qry.x
+        L_domain = float(np.ptp(x, axis=0).max()) if len(x) > 1 else 1.0
+        sigma_t_floor = 1.0 / max(L_domain, 1.0)
+        phi = q_flat / np.maximum(sigma_t, sigma_t_floor)
 
         # Scattering source iterations
         for _ in range(self.n_iter):
             scat_src = sigma_s_flat * phi / (4 * np.pi)  # isotropic scattering
-            phi_new = (q_flat + scat_src) / np.maximum(sigma_t, 1e-8)
+            phi_new = (q_flat + scat_src) / np.maximum(sigma_t, sigma_t_floor)
             phi = phi_new
 
         phi = np.clip(phi, 1e-15, None)
@@ -155,27 +169,42 @@ class MockSolver:
 
     def _compute_gradient(self, phi: np.ndarray, x: np.ndarray,
                           D: np.ndarray) -> np.ndarray:
-        """Approximate gradient using nearest-neighbor differences."""
+        """
+        Compute J = -D∇φ on a structured grid using numpy.gradient.
+
+        D is flux-limited: D * |∇φ| ≤ φ to avoid blow-up in near-vacuum regions
+        (relevant for void benchmarks like Kobayashi where σ_t ≈ 0).
+        """
         Nx, G = phi.shape
         dim = x.shape[1]
-        J = np.zeros((Nx, dim, G), dtype=np.float64)
 
+        # Infer grid shape from point count and dimensionality
+        n = round(Nx ** (1.0 / dim))
+        try:
+            spatial_shape = tuple([n] * dim)
+            assert np.prod(spatial_shape) == Nx
+        except AssertionError:
+            # Non-cubic grid: fall back to zero current (isotropic)
+            return np.zeros((Nx, dim, G), dtype=np.float64)
+
+        J = np.zeros((Nx, dim, G), dtype=np.float64)
+        # Compute cell spacing along each dimension
         for d in range(dim):
-            x_d = x[:, d]
-            for i in range(Nx):
-                # Find neighbors along this dimension (nearest points)
-                diffs = x_d - x_d[i]
-                pos_mask = diffs > 0
-                neg_mask = diffs < 0
-                if pos_mask.any():
-                    j_pos = np.argmin(np.where(pos_mask, diffs, np.inf))
-                    dphi = (phi[j_pos] - phi[i]) / (diffs[j_pos] + 1e-8)
-                    J[i, d, :] = -D[i] * dphi
-                if neg_mask.any():
-                    j_neg = np.argmax(np.where(neg_mask, diffs, -np.inf))
-                    dphi = (phi[i] - phi[j_neg]) / (diffs[j_neg].abs() + 1e-8) if hasattr(diffs[j_neg], 'abs') else (phi[i] - phi[j_neg]) / (abs(diffs[j_neg]) + 1e-8)
-                    J[i, d, :] += -D[i] * dphi
-                    J[i, d, :] /= 2.0  # average
+            coords_d = x[:, d].reshape(spatial_shape)
+            # Use first column to get spacing (uniform grid assumed)
+            idx = [0] * dim
+            idx[d] = slice(None)
+            coords_1d = coords_d[tuple(idx)]
+            spacing = float(coords_1d[1] - coords_1d[0]) if len(coords_1d) > 1 else 1.0
+            spacing = max(abs(spacing), 1e-30)
+
+            for g in range(G):
+                phi_grid = phi[:, g].reshape(spatial_shape)
+                grad_d = np.gradient(phi_grid, spacing, axis=d).reshape(Nx)  # [Nx]
+                # Flux-limited D: D * |∇φ| ≤ φ  (free-streaming limit)
+                phi_safe = np.maximum(phi[:, g], 1e-30)
+                D_lim = np.minimum(D[:, g], phi_safe / (np.abs(grad_d) + 1e-30))
+                J[:, d, g] = -D_lim * grad_d
 
         return J
 
@@ -183,35 +212,39 @@ class MockSolver:
                                 qry: QueryPoints, inp: InputFields, g: float) -> np.ndarray:
         """
         Reconstruct I(x, omega) from moments using P1 angular reconstruction.
-        I(x, omega) = phi(x) / (4*pi) + (3/(4*pi)) * J(x) . omega
-        This is the P1 (first-order spherical harmonic) expansion.
+
+        2D: I(x,Ω) = φ/(2π) * [1 + (3·J·Ω) / (2π·φ)]
+        3D: I(x,Ω) = φ/(4π) * [1 + (3·J·Ω) / (4π·φ)]
+
+        With optional Henyey-Greenstein correction for anisotropic scattering.
         """
         Nx, G = phi.shape
-        Nw = qry.n_omega
         omega = qry.omega  # [Nw, dim]
         dim = inp.dim
 
         norm = 4 * np.pi if dim == 3 else 2 * np.pi
 
-        # Isotropic part
-        I = phi[:, np.newaxis, :] / norm  # [Nx, 1, G]
+        # Isotropic baseline
+        I = phi[:, np.newaxis, :] / norm  # [Nx, 1, G]  (broadcasts to [Nx, Nw, G])
 
-        # P1 correction (anisotropic streaming)
-        if J is not None and dim <= omega.shape[1]:
-            # J: [Nx, dim, G], omega: [Nw, dim]
-            # J.omega: [Nx, Nw, G]
-            J_dot_omega = np.einsum("ndig,wd->nwg", J[:, np.newaxis, :, :] if False else
-                                    J.reshape(Nx, dim, G), omega)
-            I = I + (dim / norm) * J_dot_omega[:, :, :]
+        # P1 correction: I += (3/norm) * (J·Ω) / norm * phi  =>  multiply I_iso by correction
+        if J is not None:
+            # J: [Nx, dim, G],  omega: [Nw, dim]
+            J_arr = J.reshape(Nx, dim, G)
+            J_dot_omega = np.einsum('xdg,wd->xwg', J_arr, omega)       # [Nx, Nw, G]
+            phi_safe = np.maximum(phi[:, np.newaxis, :], 1e-30)
+            correction = 1.0 + (3.0 / norm) * J_dot_omega / phi_safe
+            correction = np.maximum(correction, 0.0)
+            I = I * correction
 
-        # Henyey-Greenstein anisotropy correction
+        # Henyey-Greenstein anisotropy correction for scattering problems
         if abs(g) > 1e-4:
             z_hat = np.zeros(omega.shape[1], dtype=np.float32)
             z_hat[-1] = 1.0
-            mu = omega @ z_hat  # [Nw]
-            hg = (1 - g**2) / (1 + g**2 - 2 * g * mu + 1e-8)**1.5  # [Nw]
-            hg_norm = hg.mean()
-            I = I * (hg[np.newaxis, :, np.newaxis] / (hg_norm + 1e-8))
+            mu = omega @ z_hat                                          # [Nw]
+            hg = (1 - g**2) / (1 + g**2 - 2 * g * mu + 1e-8)**1.5    # [Nw]
+            hg_norm = hg.mean() + 1e-8
+            I = I * (hg[np.newaxis, :, np.newaxis] / hg_norm)
 
         return np.clip(I.astype(np.float32), 1e-30, None)
 

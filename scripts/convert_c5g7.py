@@ -38,10 +38,13 @@ def main():
     p.add_argument("--spatial_shape", type=int, nargs="+", default=[17, 17])
     p.add_argument("--n_omega", type=int, default=16)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--solver", default="auto", choices=["auto", "mock", "openmc"],
+                   help="'auto' uses the best available real solver, falling back to mock")
     args = p.parse_args()
 
     set_seed(args.seed)
     import numpy as np
+    from src.solvers import get_solver, detect_best_solver
 
     logger.info("C5G7 MOX Converter")
     logger.info(f"  raw_dir: {args.raw_dir}")
@@ -49,7 +52,7 @@ def main():
     if args.raw_dir:
         raw_dir = Path(args.raw_dir)
         if not raw_dir.exists():
-            logger.warning(f"raw_dir {raw_dir} does not exist. Using mock data.")
+            logger.warning(f"raw_dir {raw_dir} does not exist. Proceeding without raw dir.")
             raw_dir = None
     else:
         raw_dir = None
@@ -67,6 +70,19 @@ def main():
         n_omega=args.n_omega,
         rng=rng,
     )
+
+    # Run real solver if available
+    resolved_solver = detect_best_solver("c5g7") if args.solver == "auto" else args.solver
+    logger.info(
+        f"Solver: {resolved_solver}"
+        + ("  (auto-selected)" if args.solver == "auto" else "")
+    )
+    if resolved_solver != "mock":
+        solver = get_solver(resolved_solver, benchmark="c5g7", fallback=True)
+        logger.info(f"Running {resolved_solver} solver on {len(samples)} samples…")
+        samples = solver.batch_solve(samples)
+    else:
+        logger.warning("No real solver available for c5g7 — targets are diffusion approximation.")
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

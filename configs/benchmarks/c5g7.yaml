@@ -6,7 +6,7 @@ n_samples_train: 200
 n_samples_val: 50
 n_samples_test: 50
 epsilon_range: [0.01, 1.0]
-solver: diffusion_approx
+solver: auto
 raw_dir: null
 time_dependent: false
 domain_size_cm: 64.26

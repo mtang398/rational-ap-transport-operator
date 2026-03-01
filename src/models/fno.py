@@ -119,6 +119,7 @@ class FNOTransport(nn.Module):
         params: Tensor,
         x: Tensor,
         t: Optional[Tensor] = None,
+        batch_param_keys: Optional[List[str]] = None,
     ) -> Tensor:
         """
         Build per-cell feature vector and lift to FNO channel space.
@@ -155,7 +156,7 @@ class FNOTransport(nn.Module):
         features = self.lift(features)        # [B, Nx, fno_channels]
 
         # Add param encoding as spatial bias
-        param_feat = self.param_enc(params).unsqueeze(1)  # [B, 1, fno_channels]
+        param_feat = self.param_enc(params, batch_param_keys).unsqueeze(1)  # [B, 1, fno_channels]
         features = features + param_feat
 
         return features
@@ -259,6 +260,7 @@ class FNOTransport(nn.Module):
         q = batch["q"]
         bc = batch["bc"]             # [B, n_bc_faces, 2]
         params = batch["params"]     # [B, P]
+        param_keys = batch.get("param_keys")
         x = batch["x"]               # [B, Nx, dim]
         omega = batch["omega"]       # [B, Nw, dim]
         w_omega = batch["w_omega"]   # [B, Nw]
@@ -267,7 +269,7 @@ class FNOTransport(nn.Module):
         spatial_shape = batch["spatial_shape"]
 
         # Encode inputs
-        features = self.encode_inputs(sigma_a, sigma_s, q, bc, params, x, t)
+        features = self.encode_inputs(sigma_a, sigma_s, q, bc, params, x, t, batch_param_keys=param_keys)
 
         # FNO on grid
         latent = self.apply_fno(features, spatial_shape)  # [B, Nx, C]

@@ -28,10 +28,14 @@ def main():
     p.add_argument("--n_omega", type=int, default=16)
     p.add_argument("--wavelength_um", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=3)
+    p.add_argument("--solver", default="auto", choices=["auto", "mock"],
+                   help="'auto' uses the best available real solver, falling back to mock. "
+                        "No external solver is currently integrated for pinte2009.")
     args = p.parse_args()
 
     set_seed(args.seed)
     import numpy as np
+    from src.solvers import detect_best_solver, get_solver
     rng = np.random.default_rng(args.seed)
 
     converter = Pinte2009Converter(raw_dir=args.raw_dir, wavelength_um=args.wavelength_um)
@@ -41,6 +45,22 @@ def main():
         n_omega=args.n_omega,
         rng=rng,
     )
+
+    # Run real solver if available (pinte2009 has no external solver integrated yet)
+    resolved_solver = detect_best_solver("pinte2009") if args.solver == "auto" else args.solver
+    logger.info(
+        f"Solver: {resolved_solver}"
+        + ("  (auto-selected)" if args.solver == "auto" else "")
+    )
+    if resolved_solver != "mock":
+        solver = get_solver(resolved_solver, benchmark="pinte2009", fallback=True)
+        logger.info(f"Running {resolved_solver} solver on {len(samples)} samples…")
+        samples = solver.batch_solve(samples)
+    else:
+        logger.warning(
+            "No real solver available for pinte2009 — targets are analytic/approximate. "
+            "Add an external RT solver integration to src/solvers/ to change this."
+        )
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

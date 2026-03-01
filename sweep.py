@@ -37,6 +37,13 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--n_samples_train", type=int, default=100)
     p.add_argument("--output_dir", default="runs/sweep")
+    p.add_argument("--data_dir", default="runs/datasets",
+                   help="Directory with pre-generated datasets. On-the-fly solver "
+                        "generation is used when a split file is not found.")
+    p.add_argument("--solver", default="auto",
+                   choices=["auto", "mock", "opensn", "openmc"],
+                   help="Solver for on-the-fly generation. 'auto' uses the best "
+                        "available real solver, falling back to mock.")
     p.add_argument("--dry_run", action="store_true", help="Print commands without running")
     p.add_argument("--device", default=None)
     return p.parse_args()
@@ -44,8 +51,6 @@ def parse_args():
 
 BENCHMARK_DEFAULTS = {
     "c5g7":      {"spatial_shape": (51, 51), "n_groups": 7,  "dim": 2},
-    "c5g7_td":   {"spatial_shape": (51, 51), "n_groups": 7,  "dim": 2},
-    "kobayashi": {"spatial_shape": (20, 20, 20), "n_groups": 1, "dim": 3},
     "pinte2009": {"spatial_shape": (32, 32),  "n_groups": 1, "dim": 2},
 }
 
@@ -69,6 +74,8 @@ def run_training(args, seed: int, n_omega: int, resolution_mult: int) -> Dict[st
         "--run_name", run_name,
         "--seed", str(seed),
         "--log_dir", args.output_dir,
+        "--data_dir", args.data_dir,
+        "--solver", args.solver,
     ]
     if args.device:
         cmd += ["--device", args.device]
@@ -116,6 +123,8 @@ def run_eval(args, run_info: Dict[str, Any]) -> Dict[str, Any]:
         "--n_test_samples", "30",
         "--batch_size", "4",
         "--seed", str(run_info["seed"]),
+        "--data_dir", args.data_dir,
+        "--solver", args.solver,
     ]
 
     logger.info(f"Eval: {' '.join(cmd)}")
@@ -147,6 +156,13 @@ def run_eval(args, run_info: Dict[str, Any]) -> Dict[str, Any]:
 def main():
     setup_logging("INFO")
     args = parse_args()
+
+    from src.utils.logging_utils import log_environment_info
+    log_environment_info(
+        benchmark_name=args.benchmark,
+        model_name=args.model,
+        data_dir="runs/datasets",
+    )
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
